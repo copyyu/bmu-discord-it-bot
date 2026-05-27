@@ -12,12 +12,15 @@
  *   DISCORD_WEBHOOK_IT_TICKET https://discord.com/api/webhooks/...
  *
  * Optional env:
+ *   PORT                      if set, starts HTTP server with /health endpoint
+ *                             (used by Render + UptimeRobot keep-alive trick)
  *   BOT_NAME                  override displayed username (default "BMU IT Bot")
  *   MENTION                   '@everyone' (default), '@here', '<@&ROLE_ID>', or '' to disable
  *   RECONNECT_DELAY_MS        ms before reconnect on DB drop (default 5000)
  */
 
 import pg from 'pg'
+import { createServer } from 'http'
 
 const { Client } = pg
 
@@ -212,6 +215,39 @@ async function connectAndListen() {
     }
 }
 
+/**
+ * Optional HTTP server for keep-alive ping
+ * Only starts if PORT env is set (Render injects it; local PM2 does not)
+ * UptimeRobot pings /health every 5 min to prevent Render free tier sleep
+ */
+function startKeepAliveServer() {
+    const port = Number(process.env.PORT)
+    if (!port) {
+        console.log('ℹ️  PORT not set — skipping HTTP server (local mode)')
+        return
+    }
+    const startedAt = Date.now()
+    const server = createServer((req, res) => {
+        if (req.url === '/health' || req.url === '/') {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({
+                status: 'ok',
+                uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+                bot: BOT_NAME,
+            }))
+        } else {
+            res.writeHead(404)
+            res.end()
+        }
+    })
+    server.listen(port, () => {
+        console.log(`🌐 Keep-alive server on port ${port} — endpoint: /health`)
+    })
+    server.on('error', (err) => {
+        console.error('⚠️ HTTP server error:', err.message)
+    })
+}
+
 process.on('SIGINT', () => {
     console.log('\n👋 Shutting down...')
     process.exit(0)
@@ -221,4 +257,5 @@ process.on('SIGTERM', () => {
     process.exit(0)
 })
 
+startKeepAliveServer()
 connectAndListen()

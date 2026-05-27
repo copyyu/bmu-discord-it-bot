@@ -5,7 +5,8 @@
     "description": "Standalone Discord bot — listens to PostgreSQL NOTIFY and forwards new IT tickets to a Discord webhook",
     "main": "index.js",
     "scripts": {
-        "start": "node --env-file=.env index.js",
+        "start": "node index.js",
+        "start:local": "node --env-file=.env index.js",
         "dev": "node --watch --env-file=.env index.js",
         "install-trigger": "node --env-file=.env install-trigger.js"
     },

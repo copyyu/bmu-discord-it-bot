@@ -100,11 +100,53 @@ fly deploy
 fly logs
 ```
 
-### Option C: Render (free tier)
+### Option C: Render Free Web Service + UptimeRobot (ฟรีจริง ไม่ต้องบัตร) ⭐
 
-หมายเหตุ: Render free tier เป็น **Web Service** ที่จะ sleep หลัง 15 นาทีไม่มี request — bot นี้ไม่ใช่ web service (ไม่มี HTTP endpoint) จึงต้องใช้ **Background Worker** ซึ่ง**ไม่ฟรี** ($7/month)
+Bot มี HTTP `/health` endpoint อยู่แล้ว (เปิดอัตโนมัติเมื่อ `PORT` env ถูกตั้ง) — Render Free Web Service จะ sleep หลัง 15 นาทีไม่มี request เราใช้ UptimeRobot ping `/health` ทุก 5 นาที → ไม่ sleep, ฟรีตลอด
 
-ถ้าจะใช้ Render ฟรี ต้องเพิ่ม HTTP health endpoint แล้ว ping ตัวเองทุก 10 นาที — ซับซ้อนเกินไป → แนะนำ Fly.io แทน
+**Step 1 — Deploy บน Render**
+
+1. ไป https://render.com/ → Sign up ด้วย GitHub (ไม่ต้องใส่บัตรเครดิต)
+2. Dashboard → **New +** → **Web Service**
+3. Connect GitHub repo `bmu-discord-it-bot`
+4. ตั้งค่า:
+   - **Name:** `bmu-discord-it-bot` (หรือชื่อที่ต้องการ)
+   - **Region:** Singapore
+   - **Branch:** `main`
+   - **Runtime:** `Node`
+   - **Build Command:** `npm install`
+   - **Start Command:** `npm start`
+   - **Instance Type:** **Free**
+5. เลื่อนลง **Environment Variables** → กด **Add Environment Variable**:
+   | Key | Value |
+   |-----|-------|
+   | `DATABASE_URL` | (postgres connection string) |
+   | `DISCORD_WEBHOOK_IT_TICKET` | (Discord webhook URL) |
+   | `MENTION` | `@everyone` (หรือเว้น) |
+6. กด **Create Web Service** → Render จะ build + deploy (~3 นาที)
+7. เมื่อ deploy เสร็จ จะได้ URL เช่น `https://bmu-discord-it-bot.onrender.com` — ทดสอบ: เปิด `https://<your-url>/health` ใน browser ควรเห็น JSON `{"status":"ok",...}`
+
+**Step 2 — ตั้ง UptimeRobot ping ไม่ให้ sleep**
+
+1. ไป https://uptimerobot.com/ → Sign up ฟรี (ไม่ต้องบัตร)
+2. Dashboard → **+ New Monitor**
+3. ตั้งค่า:
+   - **Monitor Type:** `HTTP(s)`
+   - **Friendly Name:** `BMU Discord Bot Keep-Alive`
+   - **URL:** `https://<your-render-url>/health`
+   - **Monitoring Interval:** `5 minutes` (free tier minimum)
+4. **Create Monitor**
+5. รอ ~10 นาที — UptimeRobot จะ ping bot ทุก 5 นาที ทำให้ Render ไม่ sleep
+
+**Step 3 — Update flow ในอนาคต**
+
+แก้โค้ด → `git push origin main` → Render auto re-deploy อัตโนมัติ (เห็น log ใน Render dashboard)
+
+**ข้อจำกัด:**
+- Render free: 750 ชม./เดือน, 512MB RAM (เพียงพอสำหรับ bot นี้)
+- ถ้าไม่มี ping เข้ามา 15 นาที → sleep + ใช้เวลา ~30 วิ wake up ครั้งแรก
+- ช่วง 30 วิ wake up: ถ้ามี ticket เข้ามาตอนนั้น = **อาจพลาด** (เพราะ DB LISTEN ขาด)
+- UptimeRobot ป้องกัน sleep ได้ ≥99% ของเวลา
 
 ### Option D: รันบน PC ตัวเอง (ฟรี แต่ PC ต้องเปิด)
 
