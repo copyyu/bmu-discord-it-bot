@@ -66,9 +66,6 @@ function buildEmbed(ticket) {
     const meta = CATEGORY_META[ticket.category] || DEFAULT_META
     const rawDesc = (ticket.description || '(ไม่มีรายละเอียด)').slice(0, 1800)
     const quotedDesc = rawDesc.split('\n').map((line) => `> ${line}`).join('\n')
-    const createdUnix = ticket.created_at
-        ? Math.floor(new Date(ticket.created_at).getTime() / 1000)
-        : Math.floor(Date.now() / 1000)
 
     return {
         author: { name: '🎫 มี IT Ticket ใหม่เข้ามา' },
@@ -79,10 +76,8 @@ function buildEmbed(ticket) {
             { name: '📁 หมวดหมู่', value: `**${meta.label}**`, inline: true },
             { name: '👤 ผู้แจ้ง', value: `**${ticket.reporter_name || '-'}**`, inline: true },
             { name: '🚦 สถานะ', value: STATUS_BADGE[ticket.status] || `\`${ticket.status}\``, inline: true },
-            { name: '​', value: `🕐 แจ้งเมื่อ <t:${createdUnix}:R>  •  <t:${createdUnix}:f>`, inline: false },
         ],
         footer: { text: 'BMU Work Management  •  IT Support System' },
-        timestamp: new Date(createdUnix * 1000).toISOString(),
     }
 }
 
