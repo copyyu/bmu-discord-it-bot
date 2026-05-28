@@ -39,30 +39,40 @@ try {
     await client.query(sql)
     console.log('✅ Trigger installed')
 
+    const expected = [
+        'it_tickets_notify_insert',
+        'it_tickets_notify_update',
+        'equipment_borrowings_notify_insert',
+        'equipment_borrowings_notify_update',
+    ]
     const result = await client.query(
-        `SELECT tgname FROM pg_trigger
-         WHERE tgname IN ('it_tickets_notify_insert', 'it_tickets_notify_update')`
+        `SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])`,
+        [expected]
     )
     const found = result.rows.map((r) => r.tgname)
-    const expected = ['it_tickets_notify_insert', 'it_tickets_notify_update']
     const missing = expected.filter((t) => !found.includes(t))
 
     if (missing.length === 0) {
-        console.log('✅ Verified — triggers installed:')
+        console.log('✅ Verified — all 4 triggers installed:')
         expected.forEach((t) => console.log(`     • ${t}`))
     } else {
         console.error('⚠️ Missing triggers:', missing.join(', '))
         process.exit(1)
     }
 
-    const col = await client.query(
-        `SELECT column_name FROM information_schema.columns
-         WHERE table_name = 'it_tickets' AND column_name = 'discord_message_id'`
+    const cols = await client.query(
+        `SELECT table_name, column_name FROM information_schema.columns
+         WHERE column_name = 'discord_message_id'
+           AND table_name IN ('it_tickets', 'equipment_borrowings')`
     )
-    if (col.rows.length > 0) {
-        console.log('✅ Verified — column "discord_message_id" exists')
+    const expectedTables = ['it_tickets', 'equipment_borrowings']
+    const foundTables = cols.rows.map((r) => r.table_name)
+    const missingTables = expectedTables.filter((t) => !foundTables.includes(t))
+    if (missingTables.length === 0) {
+        console.log('✅ Verified — discord_message_id column exists in:')
+        expectedTables.forEach((t) => console.log(`     • ${t}`))
     } else {
-        console.error('⚠️ Column discord_message_id not found')
+        console.error('⚠️ Missing discord_message_id column in:', missingTables.join(', '))
         process.exit(1)
     }
 } catch (error) {

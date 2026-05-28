@@ -3,9 +3,14 @@
 -- ============================================================
 -- รัน script นี้ครั้งเดียวบน production database
 -- จะติดตั้ง:
---   1) คอลัมน์ discord_message_id (เก็บ id ของ Discord message ที่ส่งไป)
---   2) Trigger INSERT → NOTIFY 'new_it_ticket' (ส่งแจ้งเตือนเข้า Discord)
---   3) Trigger UPDATE → NOTIFY 'it_ticket_resolved' (ลบ message เมื่อ ticket เสร็จ)
+--   IT Tickets:
+--     1) คอลัมน์ it_tickets.discord_message_id
+--     2) INSERT trigger → NOTIFY 'new_it_ticket'
+--     3) UPDATE trigger → NOTIFY 'it_ticket_resolved' (resolved/closed)
+--   Equipment Borrowings:
+--     4) คอลัมน์ equipment_borrowings.discord_message_id
+--     5) INSERT trigger → NOTIFY 'new_equipment_borrowing' (JOIN equipment + users)
+--     6) UPDATE trigger → NOTIFY 'equipment_borrowing_resolved' (approved/rejected)
 --
 -- รันซ้ำได้ปลอดภัย (idempotent)
 --
@@ -14,12 +19,14 @@
 --   npm run install-trigger
 -- ============================================================
 
+-- ============================================================
+-- IT TICKETS
+-- ============================================================
+
 -- 1) เพิ่มคอลัมน์เก็บ Discord message id (รันซ้ำได้)
 ALTER TABLE it_tickets ADD COLUMN IF NOT EXISTS discord_message_id VARCHAR(64);
 
--- ============================================================
 -- 2) INSERT trigger — NOTIFY ตอนสร้าง ticket ใหม่
--- ============================================================
 CREATE OR REPLACE FUNCTION notify_new_it_ticket()
 RETURNS trigger AS $$
 DECLARE
@@ -46,15 +53,12 @@ CREATE TRIGGER it_tickets_notify_insert
     FOR EACH ROW
     EXECUTE FUNCTION notify_new_it_ticket();
 
--- ============================================================
 -- 3) UPDATE trigger — NOTIFY ตอน status เปลี่ยนเป็น resolved/closed
--- ============================================================
 CREATE OR REPLACE FUNCTION notify_ticket_resolved()
 RETURNS trigger AS $$
 DECLARE
     payload json;
 BEGIN
-    -- ทำงานเฉพาะตอน status เปลี่ยนเป็น resolved หรือ closed
     IF NEW.status IN ('resolved', 'closed') AND OLD.status IS DISTINCT FROM NEW.status THEN
         payload := json_build_object(
             'id',                 NEW.id,
@@ -74,6 +78,89 @@ CREATE TRIGGER it_tickets_notify_update
     FOR EACH ROW
     EXECUTE FUNCTION notify_ticket_resolved();
 
+
+-- ============================================================
+-- EQUIPMENT BORROWINGS
+-- ============================================================
+
+-- 4) เพิ่มคอลัมน์เก็บ Discord message id
+ALTER TABLE equipment_borrowings ADD COLUMN IF NOT EXISTS discord_message_id VARCHAR(64);
+
+-- 5) INSERT trigger — NOTIFY ตอนมีคนขอยืมใหม่ (JOIN equipment + users)
+CREATE OR REPLACE FUNCTION notify_new_equipment_borrowing()
+RETURNS trigger AS $$
+DECLARE
+    payload          json;
+    eq_name          TEXT;
+    eq_asset_tag     TEXT;
+    eq_category      TEXT;
+    borrower_name    TEXT;
+    borrower_nick    TEXT;
+BEGIN
+    SELECT name, asset_tag, category
+        INTO eq_name, eq_asset_tag, eq_category
+        FROM equipment WHERE id = NEW.equipment_id;
+
+    SELECT name, nick_name
+        INTO borrower_name, borrower_nick
+        FROM users WHERE id = NEW.borrower_id;
+
+    payload := json_build_object(
+        'id',                   NEW.id,
+        'equipment_id',         NEW.equipment_id,
+        'equipment_name',       eq_name,
+        'equipment_asset_tag',  eq_asset_tag,
+        'equipment_category',   eq_category,
+        'borrower_id',          NEW.borrower_id,
+        'borrower_name',        borrower_name,
+        'borrower_nick',        borrower_nick,
+        'borrow_date',          NEW.borrow_date,
+        'expected_return_date', NEW.expected_return_date,
+        'purpose',              NEW.purpose,
+        'status',               NEW.status
+    );
+    PERFORM pg_notify('new_equipment_borrowing', payload::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS equipment_borrowings_notify_insert ON equipment_borrowings;
+CREATE TRIGGER equipment_borrowings_notify_insert
+    AFTER INSERT ON equipment_borrowings
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_new_equipment_borrowing();
+
+-- 6) UPDATE trigger — NOTIFY ตอน status เปลี่ยนจาก pending (approve/reject)
+CREATE OR REPLACE FUNCTION notify_equipment_borrowing_resolved()
+RETURNS trigger AS $$
+DECLARE
+    payload json;
+BEGIN
+    -- ลบ Discord message เมื่อ admin ตัดสินใจ (approved/rejected/borrowed)
+    -- ไม่ทำงานตอน status เปลี่ยนเป็น returned (ตอนนั้น message หายไปแล้ว)
+    IF NEW.status IN ('approved', 'rejected', 'borrowed')
+       AND OLD.status = 'pending'
+       AND OLD.status IS DISTINCT FROM NEW.status
+    THEN
+        payload := json_build_object(
+            'id',                 NEW.id,
+            'status',             NEW.status,
+            'discord_message_id', NEW.discord_message_id
+        );
+        PERFORM pg_notify('equipment_borrowing_resolved', payload::text);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS equipment_borrowings_notify_update ON equipment_borrowings;
+CREATE TRIGGER equipment_borrowings_notify_update
+    AFTER UPDATE ON equipment_borrowings
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_equipment_borrowing_resolved();
+
 -- เสร็จ — ทดสอบโดย:
---   1. สร้าง ticket ใหม่ → ดูว่า Discord เด้งมั้ย
---   2. กด resolve/close ticket → ดูว่า message ใน Discord หายมั้ย
+--   IT ticket: สร้าง ticket → ดูว่าเด้งใน channel #1
+--               กด resolve → message หาย
+--   Equipment: กดยืมอุปกรณ์ → ดูว่าเด้งใน channel #2
+--               admin กด approve/reject → message หาย

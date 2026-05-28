@@ -2,8 +2,12 @@
  * BMU Discord IT Bot
  *
  * Listens to PostgreSQL NOTIFY channels and forwards events to Discord:
- *   - new_it_ticket       → POST new embed to Discord
- *   - it_ticket_resolved  → DELETE existing Discord message when status = resolved/closed
+ *   IT tickets:
+ *     - new_it_ticket               → POST embed via DISCORD_WEBHOOK_IT_TICKET
+ *     - it_ticket_resolved          → DELETE message (resolved/closed)
+ *   Equipment borrowings (optional — only if DISCORD_WEBHOOK_EQUIPMENT set):
+ *     - new_equipment_borrowing     → POST embed via DISCORD_WEBHOOK_EQUIPMENT
+ *     - equipment_borrowing_resolved → DELETE message (approved/rejected)
  *
  * No coupling with the web app — the only contract is the DB triggers in setup.sql
  *
@@ -12,8 +16,8 @@
  *   DISCORD_WEBHOOK_IT_TICKET https://discord.com/api/webhooks/...
  *
  * Optional env:
+ *   DISCORD_WEBHOOK_EQUIPMENT enable equipment borrowing notifications
  *   PORT                      if set, starts HTTP server with /health endpoint
- *                             (used by Render + UptimeRobot keep-alive trick)
  *   BOT_NAME                  override displayed username (default "BMU IT Bot")
  *   MENTION                   '@everyone' (default), '@here', '<@&ROLE_ID>', or '' to disable
  *   RECONNECT_DELAY_MS        ms before reconnect on DB drop (default 5000)
@@ -24,29 +28,9 @@ import { createServer } from 'http'
 
 const { Client } = pg
 
-const NEW_CHANNEL = 'new_it_ticket'
-const RESOLVED_CHANNEL = 'it_ticket_resolved'
 const BOT_NAME = process.env.BOT_NAME || 'BMU IT Bot'
 const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS) || 5000
-// MENTION = '@everyone' (ปลุกทุกคน), '@here' (เฉพาะ online), '<@&ROLE_ID>' (เฉพาะ role)
-// ปล่อยว่าง = ไม่ tag ใครเลย
 const MENTION = process.env.MENTION ?? '@everyone'
-
-const CATEGORY_META = {
-    system_issue: { emoji: '⚙️', label: 'ปัญหาระบบ', color: 0xff4d4f },
-    equipment_issue: { emoji: '🖥️', label: 'ปัญหาอุปกรณ์', color: 0xfa8c16 },
-    feature_request: { emoji: '✨', label: 'ขอฟีเจอร์ใหม่', color: 0x1890ff },
-    nas_issue: { emoji: '💾', label: 'ปัญหา NAS', color: 0x722ed1 },
-}
-
-const STATUS_BADGE = {
-    open: '🟢 รอดำเนินการ',
-    in_progress: '🟡 กำลังดำเนินการ',
-    resolved: '✅ แก้ไขแล้ว',
-    closed: '⚫ ปิดแล้ว',
-}
-
-const DEFAULT_META = { emoji: '❓', label: 'อื่นๆ', color: 0xff6b35 }
 
 function requireEnv(key) {
     const value = process.env[key]
@@ -58,12 +42,74 @@ function requireEnv(key) {
 }
 
 const DATABASE_URL = requireEnv('DATABASE_URL')
-const WEBHOOK_URL = requireEnv('DISCORD_WEBHOOK_IT_TICKET')
-// stripped query params for building /messages/{id} URL
-const WEBHOOK_BASE = WEBHOOK_URL.split('?')[0]
+const TICKET_WEBHOOK = requireEnv('DISCORD_WEBHOOK_IT_TICKET').split('?')[0]
+const EQUIPMENT_WEBHOOK = process.env.DISCORD_WEBHOOK_EQUIPMENT?.split('?')[0] || null
 
-function buildEmbed(ticket) {
-    const meta = CATEGORY_META[ticket.category] || DEFAULT_META
+// ============================================================
+// IT TICKET metadata
+// ============================================================
+const TICKET_CATEGORY_META = {
+    system_issue: { emoji: '⚙️', label: 'ปัญหาระบบ', color: 0xff4d4f },
+    equipment_issue: { emoji: '🖥️', label: 'ปัญหาอุปกรณ์', color: 0xfa8c16 },
+    feature_request: { emoji: '✨', label: 'ขอฟีเจอร์ใหม่', color: 0x1890ff },
+    nas_issue: { emoji: '💾', label: 'ปัญหา NAS', color: 0x722ed1 },
+}
+const TICKET_DEFAULT_META = { emoji: '❓', label: 'อื่นๆ', color: 0xff6b35 }
+
+const TICKET_STATUS_BADGE = {
+    open: '🟢 รอดำเนินการ',
+    in_progress: '🟡 กำลังดำเนินการ',
+    resolved: '✅ แก้ไขแล้ว',
+    closed: '⚫ ปิดแล้ว',
+}
+
+// ============================================================
+// EQUIPMENT metadata
+// ============================================================
+const EQ_CATEGORY_EMOJI = {
+    monitor: '🖥️',
+    laptop: '💻',
+    desktop: '🖥️',
+    keyboard: '⌨️',
+    mouse: '🖱️',
+    headphone: '🎧',
+    headset: '🎧',
+    cable: '🔌',
+    adapter: '🔌',
+    server: '🗄️',
+    network: '🌐',
+    router: '🌐',
+    printer: '🖨️',
+    camera: '📷',
+    phone: '📱',
+    tablet: '📱',
+}
+
+const BORROW_STATUS_BADGE = {
+    pending: '🟡 รออนุมัติ',
+    approved: '🟢 อนุมัติแล้ว',
+    borrowed: '📤 กำลังยืม',
+    rejected: '❌ ปฏิเสธ',
+    returned: '✅ คืนแล้ว',
+}
+
+function eqEmoji(category) {
+    if (!category) return '📦'
+    return EQ_CATEGORY_EMOJI[category.toLowerCase()] || '📦'
+}
+
+function formatDateRange(start, end) {
+    const s = String(start || '').slice(0, 10)
+    const e = String(end || '').slice(0, 10)
+    if (!s) return '-'
+    return s === e ? s : `${s}  →  ${e}`
+}
+
+// ============================================================
+// Embed builders
+// ============================================================
+function buildTicketEmbed(ticket) {
+    const meta = TICKET_CATEGORY_META[ticket.category] || TICKET_DEFAULT_META
     const rawDesc = (ticket.description || '(ไม่มีรายละเอียด)').slice(0, 1800)
     const quotedDesc = rawDesc.split('\n').map((line) => `> ${line}`).join('\n')
 
@@ -75,18 +121,43 @@ function buildEmbed(ticket) {
         fields: [
             { name: '📁 หมวดหมู่', value: `**${meta.label}**`, inline: true },
             { name: '👤 ผู้แจ้ง', value: `**${ticket.reporter_name || '-'}**`, inline: true },
-            { name: '🚦 สถานะ', value: STATUS_BADGE[ticket.status] || `\`${ticket.status}\``, inline: true },
+            { name: '🚦 สถานะ', value: TICKET_STATUS_BADGE[ticket.status] || `\`${ticket.status}\``, inline: true },
         ],
         footer: { text: 'BMU Work Management  •  IT Support System' },
     }
 }
 
-/**
- * Send embed to Discord and return the created message id.
- * Uses ?wait=true so Discord returns the message object (with id).
- */
-async function sendToDiscord(ticket) {
-    const url = `${WEBHOOK_BASE}?wait=true`
+function buildBorrowingEmbed(b) {
+    const emoji = eqEmoji(b.equipment_category)
+    const eqLine = b.equipment_name
+        ? (b.equipment_asset_tag ? `${b.equipment_asset_tag}  •  ${b.equipment_name}` : b.equipment_name)
+        : (b.equipment_asset_tag || '-')
+    const borrower = b.borrower_nick
+        ? `${b.borrower_name} (${b.borrower_nick})`
+        : (b.borrower_name || '-')
+    const purposeLine = b.purpose
+        ? (b.purpose).slice(0, 1800).split('\n').map((line) => `> ${line}`).join('\n')
+        : '> _(ไม่ระบุเหตุผล)_'
+
+    return {
+        author: { name: '📦 มีคำขอยืมอุปกรณ์ใหม่' },
+        title: `${emoji}  ${eqLine}`,
+        description: `**📝 เหตุผลการยืม**\n${purposeLine}\n​`,
+        color: 0xff6b35, // BMU primary orange
+        fields: [
+            { name: '👤 ผู้ขอยืม', value: `**${borrower}**`, inline: true },
+            { name: '📅 ช่วงวันที่', value: formatDateRange(b.borrow_date, b.expected_return_date), inline: true },
+            { name: '🚦 สถานะ', value: BORROW_STATUS_BADGE[b.status] || `\`${b.status}\``, inline: true },
+        ],
+        footer: { text: 'BMU Work Management  •  Equipment Borrowing' },
+    }
+}
+
+// ============================================================
+// Discord HTTP helpers — generic over webhook URL
+// ============================================================
+async function postToWebhook(webhookBase, embed, logLabel) {
+    const url = `${webhookBase}?wait=true`
     try {
         const response = await fetch(url, {
             method: 'POST',
@@ -94,49 +165,48 @@ async function sendToDiscord(ticket) {
             body: JSON.stringify({
                 username: BOT_NAME,
                 content: MENTION || undefined,
-                embeds: [buildEmbed(ticket)],
+                embeds: [embed],
                 allowed_mentions: { parse: ['everyone', 'roles', 'users'] },
             }),
         })
 
         if (!response.ok) {
             const text = await response.text().catch(() => '')
-            console.error(`⚠️ Discord ${response.status}: ${text.slice(0, 200)}`)
+            console.error(`⚠️ Discord ${response.status} for ${logLabel}: ${text.slice(0, 200)}`)
             return null
         }
 
         const message = await response.json()
-        console.log(`✅ Sent ticket ${ticket.ticket_no} → message id ${message.id}`)
+        console.log(`✅ Sent ${logLabel} → message id ${message.id}`)
         return message.id
     } catch (error) {
-        console.error('⚠️ Discord send failed:', error.message)
+        console.error(`⚠️ Discord send failed for ${logLabel}:`, error.message)
         return null
     }
 }
 
-/**
- * Delete a Discord message previously sent by this webhook.
- * 404 is treated as "already gone" — safe to ignore.
- */
-async function deleteDiscordMessage(messageId, ticketNo) {
+async function deleteFromWebhook(webhookBase, messageId, logLabel) {
     if (!messageId) {
-        console.log(`ℹ️ No message id for ${ticketNo} — nothing to delete (skip)`)
+        console.log(`ℹ️ No message id for ${logLabel} — nothing to delete (skip)`)
         return
     }
-    const url = `${WEBHOOK_BASE}/messages/${messageId}`
+    const url = `${webhookBase}/messages/${messageId}`
     try {
         const response = await fetch(url, { method: 'DELETE' })
         if (response.ok || response.status === 404) {
-            console.log(`🗑️  Deleted Discord message for ${ticketNo}${response.status === 404 ? ' (already gone)' : ''}`)
+            console.log(`🗑️  Deleted ${logLabel}${response.status === 404 ? ' (already gone)' : ''}`)
             return
         }
         const text = await response.text().catch(() => '')
-        console.error(`⚠️ Discord DELETE ${response.status}: ${text.slice(0, 200)}`)
+        console.error(`⚠️ Discord DELETE ${response.status} for ${logLabel}: ${text.slice(0, 200)}`)
     } catch (error) {
-        console.error('⚠️ Discord delete failed:', error.message)
+        console.error(`⚠️ Discord delete failed for ${logLabel}:`, error.message)
     }
 }
 
+// ============================================================
+// Handlers — one per NOTIFY channel
+// ============================================================
 async function handleNewTicket(client, msg) {
     let ticket
     try {
@@ -147,17 +217,16 @@ async function handleNewTicket(client, msg) {
     }
     console.log(`📬 new_it_ticket: ${ticket.ticket_no}`)
 
-    const messageId = await sendToDiscord(ticket)
+    const messageId = await postToWebhook(TICKET_WEBHOOK, buildTicketEmbed(ticket), `ticket ${ticket.ticket_no}`)
     if (!messageId) return
 
-    // Save message id so we can delete it later when resolved/closed
     try {
         await client.query(
             `UPDATE it_tickets SET discord_message_id = $1 WHERE id = $2`,
             [messageId, ticket.id]
         )
     } catch (error) {
-        console.error('⚠️ Failed to save message id to DB:', error.message)
+        console.error('⚠️ Failed to save ticket message id:', error.message)
     }
 }
 
@@ -170,10 +239,48 @@ async function handleTicketResolved(msg) {
         return
     }
     console.log(`📬 it_ticket_resolved: ${payload.ticket_no} → ${payload.status}`)
-
-    await deleteDiscordMessage(payload.discord_message_id, payload.ticket_no)
+    await deleteFromWebhook(TICKET_WEBHOOK, payload.discord_message_id, `ticket ${payload.ticket_no}`)
 }
 
+async function handleNewBorrowing(client, msg) {
+    let b
+    try {
+        b = JSON.parse(msg.payload)
+    } catch (e) {
+        console.error('⚠️ Failed to parse new_equipment_borrowing payload:', e.message)
+        return
+    }
+    console.log(`📬 new_equipment_borrowing: ${b.equipment_asset_tag || b.equipment_id} by ${b.borrower_name}`)
+
+    const label = `borrow #${b.id} (${b.equipment_asset_tag || b.equipment_id})`
+    const messageId = await postToWebhook(EQUIPMENT_WEBHOOK, buildBorrowingEmbed(b), label)
+    if (!messageId) return
+
+    try {
+        await client.query(
+            `UPDATE equipment_borrowings SET discord_message_id = $1 WHERE id = $2`,
+            [messageId, b.id]
+        )
+    } catch (error) {
+        console.error('⚠️ Failed to save borrowing message id:', error.message)
+    }
+}
+
+async function handleBorrowingResolved(msg) {
+    let payload
+    try {
+        payload = JSON.parse(msg.payload)
+    } catch (e) {
+        console.error('⚠️ Failed to parse equipment_borrowing_resolved payload:', e.message)
+        return
+    }
+    console.log(`📬 equipment_borrowing_resolved: #${payload.id} → ${payload.status}`)
+    await deleteFromWebhook(EQUIPMENT_WEBHOOK, payload.discord_message_id, `borrow #${payload.id}`)
+}
+
+// ============================================================
+// DB connection — LISTEN on all enabled channels
+// ============================================================
 async function connectAndListen() {
     const client = new Client({
         connectionString: DATABASE_URL,
@@ -183,10 +290,19 @@ async function connectAndListen() {
     })
 
     client.on('notification', async (msg) => {
-        if (msg.channel === NEW_CHANNEL) {
-            await handleNewTicket(client, msg)
-        } else if (msg.channel === RESOLVED_CHANNEL) {
-            await handleTicketResolved(msg)
+        switch (msg.channel) {
+            case 'new_it_ticket':
+                await handleNewTicket(client, msg)
+                break
+            case 'it_ticket_resolved':
+                await handleTicketResolved(msg)
+                break
+            case 'new_equipment_borrowing':
+                if (EQUIPMENT_WEBHOOK) await handleNewBorrowing(client, msg)
+                break
+            case 'equipment_borrowing_resolved':
+                if (EQUIPMENT_WEBHOOK) await handleBorrowingResolved(msg)
+                break
         }
     })
 
@@ -201,20 +317,26 @@ async function connectAndListen() {
 
     try {
         await client.connect()
-        await client.query(`LISTEN ${NEW_CHANNEL}`)
-        await client.query(`LISTEN ${RESOLVED_CHANNEL}`)
-        console.log(`👂 Listening on channels "${NEW_CHANNEL}" + "${RESOLVED_CHANNEL}"`)
+        const channels = ['new_it_ticket', 'it_ticket_resolved']
+        if (EQUIPMENT_WEBHOOK) {
+            channels.push('new_equipment_borrowing', 'equipment_borrowing_resolved')
+        }
+        for (const ch of channels) {
+            await client.query(`LISTEN ${ch}`)
+        }
+        console.log(`👂 Listening on ${channels.length} channels: ${channels.join(', ')}`)
+        if (!EQUIPMENT_WEBHOOK) {
+            console.log('ℹ️  DISCORD_WEBHOOK_EQUIPMENT not set — equipment borrowing notifications disabled')
+        }
     } catch (error) {
         console.error('💥 Failed to connect/listen:', error.message)
         setTimeout(connectAndListen, RECONNECT_DELAY_MS)
     }
 }
 
-/**
- * Optional HTTP server for keep-alive ping
- * Only starts if PORT env is set (Render injects it; local PM2 does not)
- * UptimeRobot pings /health every 5 min to prevent Render free tier sleep
- */
+// ============================================================
+// Keep-alive HTTP server (only if PORT is set — e.g., Render)
+// ============================================================
 function startKeepAliveServer() {
     const port = Number(process.env.PORT)
     if (!port) {
@@ -229,6 +351,10 @@ function startKeepAliveServer() {
                 status: 'ok',
                 uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
                 bot: BOT_NAME,
+                features: {
+                    it_tickets: true,
+                    equipment_borrowings: !!EQUIPMENT_WEBHOOK,
+                },
             }))
         } else {
             res.writeHead(404)
