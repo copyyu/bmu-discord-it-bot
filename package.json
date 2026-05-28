@@ -8,7 +8,11 @@
         "start": "node index.js",
         "start:local": "node --env-file=.env index.js",
         "dev": "node --watch --env-file=.env index.js",
-        "install-trigger": "node --env-file=.env install-trigger.js"
+        "install-trigger": "node --env-file=.env install-trigger.js",
+        "test:checkin": "node --env-file=.env test-notify.js checkin",
+        "test:checkout": "node --env-file=.env test-notify.js checkout",
+        "test:ticket": "node --env-file=.env test-notify.js ticket",
+        "test:borrow": "node --env-file=.env test-notify.js borrow"
     },
     "engines": {
         "node": ">=18"
