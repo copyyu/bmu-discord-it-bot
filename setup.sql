@@ -159,8 +159,58 @@ CREATE TRIGGER equipment_borrowings_notify_update
     FOR EACH ROW
     EXECUTE FUNCTION notify_equipment_borrowing_resolved();
 
+
+-- ============================================================
+-- GPS CHECK-IN / CHECK-OUT
+-- ============================================================
+-- ไม่ต้องเก็บ message_id — check-in เป็น log ถาวร ไม่มีการลบ
+-- ส่งทุก check-in (ยกเว้น test) มา bot → bot กรองตาม username (env CHECKIN_USERNAMES)
+--   เหตุผล: เปลี่ยนรายชื่อได้ที่ env ไม่ต้องรัน SQL ใหม่ + ไม่ฝัง username ใน repo
+-- ใช้ now() AT TIME ZONE 'Asia/Bangkok' (now() เป็น timestamptz → แปลง tz ได้ตรง)
+--   แทน checked_at ที่เป็น timestamp without time zone (เลี่ยง tz ambiguity)
+
+CREATE OR REPLACE FUNCTION notify_gps_checkin()
+RETURNS trigger AS $$
+DECLARE
+    payload     json;
+    v_username  TEXT;
+    v_name      TEXT;
+    v_time      TEXT;
+BEGIN
+    -- ข้าม test check-in
+    IF COALESCE(NEW.is_test, false) = true THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT u.username, u.name
+        INTO v_username, v_name
+        FROM users u
+        WHERE u.id = NEW.user_id;
+
+    v_time := to_char(now() AT TIME ZONE 'Asia/Bangkok', 'HH24:MI');
+
+    payload := json_build_object(
+        'id',              NEW.id,
+        'user_id',         NEW.user_id,
+        'username',        v_username,
+        'name',            v_name,
+        'type',            NEW.type,
+        'distance_meters', NEW.distance_meters,
+        'event_time',      v_time
+    );
+    PERFORM pg_notify('gps_checkin_event', payload::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS gps_checkins_notify_insert ON gps_checkins;
+CREATE TRIGGER gps_checkins_notify_insert
+    AFTER INSERT ON gps_checkins
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_gps_checkin();
+
 -- เสร็จ — ทดสอบโดย:
---   IT ticket: สร้าง ticket → ดูว่าเด้งใน channel #1
---               กด resolve → message หาย
---   Equipment: กดยืมอุปกรณ์ → ดูว่าเด้งใน channel #2
---               admin กด approve/reject → message หาย
+--   IT ticket: สร้าง ticket → เด้ง channel #1 / กด resolve → message หาย
+--   Equipment: กดยืม → เด้ง channel #2 / admin approve/reject → message หาย
+--   Check-in:  คนใน CHECKIN_USERNAMES เช็คอิน/เอาท์ → เด้ง channel #3
+--               (คนอื่นไม่เด้ง — bot กรอง, test check-in ไม่เด้ง — trigger กรอง)

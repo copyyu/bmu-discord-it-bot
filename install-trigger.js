@@ -44,6 +44,7 @@ try {
         'it_tickets_notify_update',
         'equipment_borrowings_notify_insert',
         'equipment_borrowings_notify_update',
+        'gps_checkins_notify_insert',
     ]
     const result = await client.query(
         `SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])`,
@@ -53,7 +54,7 @@ try {
     const missing = expected.filter((t) => !found.includes(t))
 
     if (missing.length === 0) {
-        console.log('✅ Verified — all 4 triggers installed:')
+        console.log(`✅ Verified — all ${expected.length} triggers installed:`)
         expected.forEach((t) => console.log(`     • ${t}`))
     } else {
         console.error('⚠️ Missing triggers:', missing.join(', '))

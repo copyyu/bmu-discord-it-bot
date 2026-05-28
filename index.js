@@ -8,6 +8,9 @@
  *   Equipment borrowings (optional — only if DISCORD_WEBHOOK_EQUIPMENT set):
  *     - new_equipment_borrowing     → POST embed via DISCORD_WEBHOOK_EQUIPMENT
  *     - equipment_borrowing_resolved → DELETE message (approved/rejected)
+ *   Check-in/out (optional — only if DISCORD_WEBHOOK_CHECKIN set):
+ *     - gps_checkin_event           → POST embed via DISCORD_WEBHOOK_CHECKIN
+ *                                     filtered by CHECKIN_USERNAMES allowlist
  *
  * No coupling with the web app — the only contract is the DB triggers in setup.sql
  *
@@ -17,6 +20,9 @@
  *
  * Optional env:
  *   DISCORD_WEBHOOK_EQUIPMENT enable equipment borrowing notifications
+ *   DISCORD_WEBHOOK_CHECKIN   enable check-in/out notifications
+ *   CHECKIN_USERNAMES         comma-separated usernames to notify on check-in (else none)
+ *   CHECKIN_MENTION           mention for check-in (default '' = no ping, avoid spam)
  *   PORT                      if set, starts HTTP server with /health endpoint
  *   BOT_NAME                  override displayed username (default "BMU IT Bot")
  *   MENTION                   '@everyone' (default), '@here', '<@&ROLE_ID>', or '' to disable
@@ -44,6 +50,14 @@ function requireEnv(key) {
 const DATABASE_URL = requireEnv('DATABASE_URL')
 const TICKET_WEBHOOK = requireEnv('DISCORD_WEBHOOK_IT_TICKET').split('?')[0]
 const EQUIPMENT_WEBHOOK = process.env.DISCORD_WEBHOOK_EQUIPMENT?.split('?')[0] || null
+const CHECKIN_WEBHOOK = process.env.DISCORD_WEBHOOK_CHECKIN?.split('?')[0] || null
+// รายชื่อ username ที่จะแจ้งเตือน check-in (comma-separated) — ว่าง = ไม่แจ้งใครเลย
+const CHECKIN_USERNAMES = (process.env.CHECKIN_USERNAMES || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+// check-in ไม่ ping ใครโดย default (เป็น log เฉยๆ — ป้องกัน spam @everyone วันละหลายสิบครั้ง)
+const CHECKIN_MENTION = process.env.CHECKIN_MENTION ?? ''
 
 // ============================================================
 // IT TICKET metadata
@@ -91,6 +105,14 @@ const BORROW_STATUS_BADGE = {
     borrowed: '📤 กำลังยืม',
     rejected: '❌ ปฏิเสธ',
     returned: '✅ คืนแล้ว',
+}
+
+// ============================================================
+// CHECK-IN metadata
+// ============================================================
+const CHECKIN_TYPE_META = {
+    check_in: { emoji: '🟢', label: 'เช็คอินเข้างาน', color: 0x20c997 },
+    check_out: { emoji: '🔴', label: 'เช็คเอาท์ออกงาน', color: 0xfa5252 },
 }
 
 function eqEmoji(category) {
@@ -153,10 +175,25 @@ function buildBorrowingEmbed(b) {
     }
 }
 
+function buildCheckinEmbed(ev) {
+    const meta = CHECKIN_TYPE_META[ev.type] || { emoji: '📍', label: ev.type, color: 0xff6b35 }
+    const dist = ev.distance_meters != null ? `${Math.round(Number(ev.distance_meters))} ม.` : '-'
+    return {
+        author: { name: `${meta.emoji}  ${meta.label}` },
+        title: ev.name || ev.username || '-',
+        color: meta.color,
+        fields: [
+            { name: '🕐 เวลา', value: `**${ev.event_time || '-'}** น.`, inline: true },
+            { name: '📍 ระยะห่างจากออฟฟิศ', value: dist, inline: true },
+        ],
+        footer: { text: 'BMU Work Management  •  Attendance' },
+    }
+}
+
 // ============================================================
 // Discord HTTP helpers — generic over webhook URL
 // ============================================================
-async function postToWebhook(webhookBase, embed, logLabel) {
+async function postToWebhook(webhookBase, embed, logLabel, mention = MENTION) {
     const url = `${webhookBase}?wait=true`
     try {
         const response = await fetch(url, {
@@ -164,7 +201,7 @@ async function postToWebhook(webhookBase, embed, logLabel) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 username: BOT_NAME,
-                content: MENTION || undefined,
+                content: mention || undefined,
                 embeds: [embed],
                 allowed_mentions: { parse: ['everyone', 'roles', 'users'] },
             }),
@@ -278,6 +315,29 @@ async function handleBorrowingResolved(msg) {
     await deleteFromWebhook(EQUIPMENT_WEBHOOK, payload.discord_message_id, `borrow #${payload.id}`)
 }
 
+async function handleCheckinEvent(msg) {
+    let ev
+    try {
+        ev = JSON.parse(msg.payload)
+    } catch (e) {
+        console.error('⚠️ Failed to parse gps_checkin_event payload:', e.message)
+        return
+    }
+
+    // กรองตาม allowlist username
+    if (CHECKIN_USERNAMES.length === 0) {
+        console.log('ℹ️ CHECKIN_USERNAMES ว่าง — ข้าม check-in notify (ตั้ง env เพื่อเปิดใช้)')
+        return
+    }
+    if (!CHECKIN_USERNAMES.includes(ev.username)) {
+        return // ไม่อยู่ใน allowlist — ข้ามเงียบๆ
+    }
+
+    console.log(`📬 gps_checkin_event: ${ev.username} ${ev.type} @ ${ev.event_time}`)
+    // check-in ไม่ ping (CHECKIN_MENTION default = '')
+    await postToWebhook(CHECKIN_WEBHOOK, buildCheckinEmbed(ev), `checkin ${ev.username}`, CHECKIN_MENTION)
+}
+
 // ============================================================
 // DB connection — LISTEN on all enabled channels
 // ============================================================
@@ -303,6 +363,9 @@ async function connectAndListen() {
             case 'equipment_borrowing_resolved':
                 if (EQUIPMENT_WEBHOOK) await handleBorrowingResolved(msg)
                 break
+            case 'gps_checkin_event':
+                if (CHECKIN_WEBHOOK) await handleCheckinEvent(msg)
+                break
         }
     })
 
@@ -321,12 +384,22 @@ async function connectAndListen() {
         if (EQUIPMENT_WEBHOOK) {
             channels.push('new_equipment_borrowing', 'equipment_borrowing_resolved')
         }
+        if (CHECKIN_WEBHOOK) {
+            channels.push('gps_checkin_event')
+        }
         for (const ch of channels) {
             await client.query(`LISTEN ${ch}`)
         }
         console.log(`👂 Listening on ${channels.length} channels: ${channels.join(', ')}`)
         if (!EQUIPMENT_WEBHOOK) {
             console.log('ℹ️  DISCORD_WEBHOOK_EQUIPMENT not set — equipment borrowing notifications disabled')
+        }
+        if (!CHECKIN_WEBHOOK) {
+            console.log('ℹ️  DISCORD_WEBHOOK_CHECKIN not set — check-in notifications disabled')
+        } else if (CHECKIN_USERNAMES.length === 0) {
+            console.log('⚠️  DISCORD_WEBHOOK_CHECKIN set but CHECKIN_USERNAMES empty — no one will be notified')
+        } else {
+            console.log(`✅ Check-in notify for ${CHECKIN_USERNAMES.length} users: ${CHECKIN_USERNAMES.join(', ')}`)
         }
     } catch (error) {
         console.error('💥 Failed to connect/listen:', error.message)
@@ -354,6 +427,7 @@ function startKeepAliveServer() {
                 features: {
                     it_tickets: true,
                     equipment_borrowings: !!EQUIPMENT_WEBHOOK,
+                    checkins: !!CHECKIN_WEBHOOK && CHECKIN_USERNAMES.length > 0,
                 },
             }))
         } else {
