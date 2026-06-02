@@ -410,6 +410,42 @@ async function connectAndListen() {
     }
 }
 
+/**
+ * Self-ping — bot ยิง /health ของตัวเองทุก ๆ N นาที
+ * เพื่อให้ Render เห็น traffic + ไม่ sleep โดยไม่ต้องพึ่ง UptimeRobot
+ *
+ * จะทำงานก็ต่อเมื่อมี URL ของตัวเอง:
+ *   - บน Render: ใช้ RENDER_EXTERNAL_URL (auto-injected)
+ *   - บนที่อื่น: ตั้ง SELF_PING_URL เอง
+ *
+ * Interval default = 10 นาที (Render sleep ที่ 15 นาที → 10 = safety margin)
+ *
+ * ⚠️ Caveat: ถ้า bot ดับสนิทไม่ restart → self-ping ตาย → sleep ในที่สุด
+ *   (Render ปกติ auto-restart เมื่อ crash → ส่วนใหญ่ self-ping จะกลับมาเอง)
+ */
+function startSelfPing() {
+    const baseUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL
+    if (!baseUrl) {
+        console.log('ℹ️  No RENDER_EXTERNAL_URL / SELF_PING_URL — skipping self-ping')
+        return
+    }
+    const pingUrl = baseUrl.replace(/\/$/, '') + '/health'
+    const intervalMin = Number(process.env.SELF_PING_INTERVAL_MIN) || 10
+    const intervalMs = intervalMin * 60 * 1000
+
+    const ping = async () => {
+        try {
+            const r = await fetch(pingUrl)
+            console.log(`🏓 Self-ping ${r.status}`)
+        } catch (e) {
+            console.warn(`⚠️ Self-ping failed: ${e.message}`)
+        }
+    }
+
+    setInterval(ping, intervalMs)
+    console.log(`🏓 Self-ping every ${intervalMin} min → ${pingUrl}`)
+}
+
 // ============================================================
 // Keep-alive HTTP server (only if PORT is set — e.g., Render)
 // ============================================================
