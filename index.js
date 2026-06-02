@@ -24,6 +24,9 @@
  *   CHECKIN_USERNAMES         comma-separated usernames to notify on check-in (else none)
  *   CHECKIN_MENTION           mention for check-in (default '' = no ping, avoid spam)
  *   PORT                      if set, starts HTTP server with /health endpoint
+ *   RENDER_EXTERNAL_URL       auto-set on Render → enables self-ping
+ *   SELF_PING_URL             manual override if not on Render
+ *   SELF_PING_INTERVAL_MIN    self-ping interval in minutes (default 10)
  *   BOT_NAME                  override displayed username (default "BMU IT Bot")
  *   MENTION                   '@everyone' (default), '@here', '<@&ROLE_ID>', or '' to disable
  *   RECONNECT_DELAY_MS        ms before reconnect on DB drop (default 5000)
@@ -453,4 +456,5 @@ process.on('SIGTERM', () => {
 })
 
 startKeepAliveServer()
+startSelfPing()
 connectAndListen()
