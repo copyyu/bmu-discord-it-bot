@@ -13,6 +13,7 @@
  *   node --env-file=.env test-notify.js ticket    # ทดสอบ IT ticket
  *   node --env-file=.env test-notify.js borrow    # ทดสอบยืมอุปกรณ์
  *   node --env-file=.env test-notify.js error     # ทดสอบ error log
+ *   node --env-file=.env test-notify.js apierror  # ทดสอบ API error (4xx/5xx)
  */
 
 import pg from 'pg'
@@ -99,11 +100,27 @@ const FIXTURES = {
             created_at: new Date().toISOString(),
         },
     },
+    apierror: {
+        channel: 'new_api_error',
+        payload: {
+            id: 999999,
+            user_id: 'test-user',
+            employee_id: 'EMP-TEST',
+            user_name: 'ทดสอบ ระบบ [TEST]',
+            method: 'POST',
+            endpoint: '/api/closing-records/123/submit',
+            status_code: 500, // >= API_ERROR_MIN_STATUS (default 500) ถึงจะเด้ง
+            response_ms: 842,
+            ip_address: '10.0.0.42',
+            page_path: '/closing/assignment',
+            created_at: new Date().toISOString(),
+        },
+    },
 }
 
 const fixture = FIXTURES[which]
 if (!fixture) {
-    console.error(`❌ ไม่รู้จัก "${which}" — ใช้ได้: checkin | checkout | ticket | borrow | error`)
+    console.error(`❌ ไม่รู้จัก "${which}" — ใช้ได้: checkin | checkout | ticket | borrow | error | apierror`)
     process.exit(1)
 }
 
@@ -120,7 +137,7 @@ try {
     console.log(`✅ ส่ง test NOTIFY บน channel "${fixture.channel}" แล้ว`)
     console.log('   → เช็ค Discord channel ที่เกี่ยวข้องว่าเด้งมั้ย (ภายใน 1-2 วินาที)')
     console.log('   → ดู bot log: ควรเห็น "📬 ..." ตามด้วย "✅ Sent ..."')
-    if (which === 'ticket' || which === 'borrow' || which === 'error') {
+    if (which === 'ticket' || which === 'borrow' || which === 'error' || which === 'apierror') {
         console.log('   หมายเหตุ: message นี้จะไม่ถูกลบอัตโนมัติ — ลบเองได้')
     }
 } catch (error) {

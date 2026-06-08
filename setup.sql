@@ -15,6 +15,8 @@
 --     7) INSERT trigger → NOTIFY 'gps_checkin_event' (bot กรองตาม username)
 --   Error Logs (System Status):
 --     8) INSERT trigger → NOTIFY 'new_error_log' (แจ้งทุก error ใหม่ที่ backend log)
+--   API Access Logs (System Status):
+--     9) INSERT trigger → NOTIFY 'new_api_error' (แจ้งเมื่อพนักงานเรียก API แล้ว error 4xx/5xx)
 --
 -- รันซ้ำได้ปลอดภัย (idempotent)
 --
@@ -275,6 +277,62 @@ CREATE TRIGGER error_logs_notify_insert
     FOR EACH ROW
     EXECUTE FUNCTION notify_new_error_log();
 
+
+-- ============================================================
+-- API ACCESS LOGS  (System Status → "การเรียก API ที่ error ตามพนักงาน")
+-- ============================================================
+-- แจ้งเตือนเมื่อ "พนักงานเรียก API แล้ว error" (4xx/5xx) — ดู backend/utils/apiAccessLogger.js
+--   ตารางนี้เก็บเฉพาะ request ที่ auth แล้ว + status >= 400 + ตัด poller ออก, retention 7 วัน
+-- payload เล็ก (ไม่มี stack) — แต่ INSERT เป็น "batch" (buffered ทุก 5 วิ สูงสุด 500 แถว/ครั้ง)
+--   → ห่อ pg_notify ด้วย EXCEPTION: notify พังต้องไม่ทำให้ batch INSERT (log ทั้งชุด) rollback
+-- volume สูงกว่า error_logs → bot กรองด้วย API_ERROR_MIN_STATUS (default 500) + dedup + rate cap
+-- ไม่เก็บ message_id — เป็น log ถาวร ไม่มีการลบข้อความ
+-- CREATE IF NOT EXISTS เผื่อรัน setup ก่อน backend boot (idempotent, schema ตรงกับ backend)
+
+CREATE TABLE IF NOT EXISTS api_access_logs (
+    id           SERIAL PRIMARY KEY,
+    user_id      VARCHAR(36),
+    employee_id  VARCHAR(36),
+    user_name    VARCHAR(120),
+    method       VARCHAR(10),
+    endpoint     VARCHAR(255),
+    status_code  INTEGER,
+    response_ms  INTEGER,
+    ip_address   VARCHAR(64),
+    page_path    VARCHAR(255),
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION notify_new_api_error()
+RETURNS trigger AS $$
+BEGIN
+    BEGIN
+        PERFORM pg_notify('new_api_error', json_build_object(
+            'id',          NEW.id,
+            'user_id',     NEW.user_id,
+            'employee_id', NEW.employee_id,
+            'user_name',   NEW.user_name,
+            'method',      NEW.method,
+            'endpoint',    NEW.endpoint,
+            'status_code', NEW.status_code,
+            'response_ms', NEW.response_ms,
+            'ip_address',  NEW.ip_address,
+            'page_path',   NEW.page_path,
+            'created_at',  NEW.created_at
+        )::text);
+    EXCEPTION WHEN OTHERS THEN
+        NULL; -- notify ล้มเหลว — ปล่อยผ่าน ห้ามทำให้ batch INSERT api_access_logs พัง
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS api_access_logs_notify_insert ON api_access_logs;
+CREATE TRIGGER api_access_logs_notify_insert
+    AFTER INSERT ON api_access_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_new_api_error();
+
 -- เสร็จ — ทดสอบโดย:
 --   IT ticket: สร้าง ticket → เด้ง channel #1 / กด resolve → message หาย
 --   Equipment: กดยืม → เด้ง channel #2 / admin approve/reject → message หาย
@@ -282,3 +340,5 @@ CREATE TRIGGER error_logs_notify_insert
 --               (คนอื่นไม่เด้ง — bot กรอง, test check-in ไม่เด้ง — trigger กรอง)
 --   Error log: backend เกิด error (500/crash) → เด้ง channel #4
 --               (npm run test:error เพื่อยิง fake error เข้า bot)
+--   API error: พนักงานเรียก API แล้ว error 4xx/5xx → เด้ง channel #5
+--               (npm run test:apierror — bot กรองตาม API_ERROR_MIN_STATUS, default 5xx)

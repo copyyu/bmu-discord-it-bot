@@ -15,6 +15,10 @@
  *     - new_error_log               → POST embed via DISCORD_WEBHOOK_ERROR_LOG
  *                                     (backend 500 / crash → System Status page)
  *                                     deduped + rate-capped to survive error storms
+ *   API errors (optional — only if DISCORD_WEBHOOK_API_ERROR set):
+ *     - new_api_error               → POST embed via DISCORD_WEBHOOK_API_ERROR
+ *                                     (per-user 4xx/5xx API calls → System Status page)
+ *                                     filtered by API_ERROR_MIN_STATUS, deduped + rate-capped
  *
  * No coupling with the web app — the only contract is the DB triggers in setup.sql
  *
@@ -32,6 +36,11 @@
  *   ERROR_LOG_LEVELS          comma-separated level allowlist e.g. "error,fatal" (default all)
  *   ERROR_LOG_DEDUP_SEC       suppress identical error within N seconds (default 60)
  *   ERROR_LOG_MAX_PER_MIN     global cap of error posts per minute (default 15)
+ *   DISCORD_WEBHOOK_API_ERROR enable per-user API error (4xx/5xx) notifications
+ *   API_ERROR_MENTION         mention for API errors (default '' = no ping)
+ *   API_ERROR_MIN_STATUS      only notify when status_code >= this (default 500 = 5xx only)
+ *   API_ERROR_DEDUP_SEC       suppress same user+endpoint+status within N seconds (default 300)
+ *   API_ERROR_MAX_PER_MIN     global cap of API-error posts per minute (default 10)
  *   PORT                      if set, starts HTTP server with /health endpoint
  *   RENDER_EXTERNAL_URL       auto-set on Render → enables self-ping
  *   SELF_PING_URL             manual override if not on Render
@@ -84,6 +93,17 @@ const ERROR_LOG_LEVELS = (process.env.ERROR_LOG_LEVELS || '')
 const ERROR_LOG_DEDUP_SEC = Number(process.env.ERROR_LOG_DEDUP_SEC) || 60
 // global cap: โพสต์ error ได้ไม่เกิน N ครั้ง/นาที (default 15) — กัน flood (Discord limit ~30/นาที)
 const ERROR_LOG_MAX_PER_MIN = Number(process.env.ERROR_LOG_MAX_PER_MIN) || 15
+
+// ===== API error (System Status → การเรียก API ที่ error ตามพนักงาน) =====
+const API_ERROR_WEBHOOK = process.env.DISCORD_WEBHOOK_API_ERROR?.split('?')[0] || null
+const API_ERROR_MENTION = process.env.API_ERROR_MENTION ?? ''
+// แจ้งเฉพาะ status_code >= ค่านี้ (default 500 = เฉพาะ 5xx; ตั้ง 400 เพื่อรวม 4xx)
+// api_access_logs เก็บ 4xx/5xx อยู่แล้ว แต่ 4xx (401/403/400) เกิดบ่อย — default เลยเอาแค่ 5xx กัน spam
+const API_ERROR_MIN_STATUS = Number(process.env.API_ERROR_MIN_STATUS) || 500
+// dedup: user+method+endpoint+status เดิมซ้ำภายใน N วิ → ข้าม (default 300 = 5 นาที, ยาวกว่า error_log)
+const API_ERROR_DEDUP_SEC = Number(process.env.API_ERROR_DEDUP_SEC) || 300
+// global cap ต่อนาที (default 10) — volume สูงกว่า error_log เลยตั้งต่ำกว่า
+const API_ERROR_MAX_PER_MIN = Number(process.env.API_ERROR_MAX_PER_MIN) || 10
 
 // ============================================================
 // IT TICKET metadata
@@ -176,6 +196,38 @@ function errlogCategoryLabel(category) {
     const m = ERRLOG_CATEGORY_META[category]
     return m ? `${m.emoji} ${m.label}` : `📌 ${category}`
 }
+
+// ============================================================
+// API ERROR (per-user 4xx/5xx) metadata
+// ============================================================
+const HTTP_STATUS_TH = {
+    400: 'Bad Request — ข้อมูลไม่ถูกต้อง',
+    401: 'Unauthorized — ไม่ได้ยืนยันตัวตน',
+    403: 'Forbidden — ไม่มีสิทธิ์',
+    404: 'Not Found — ไม่พบข้อมูล',
+    405: 'Method Not Allowed',
+    409: 'Conflict — ข้อมูลชนกัน',
+    413: 'Payload Too Large — ไฟล์/ข้อมูลใหญ่เกิน',
+    422: 'Unprocessable — ข้อมูลไม่ผ่านเงื่อนไข',
+    429: 'Too Many Requests — เรียกถี่เกิน',
+    500: 'Internal Server Error',
+    502: 'Bad Gateway',
+    503: 'Service Unavailable',
+    504: 'Gateway Timeout',
+}
+function apiStatusLabel(code) {
+    const n = Number(code)
+    const txt = HTTP_STATUS_TH[n]
+    return txt ? `${n} ${txt}` : `${n}`
+}
+// 5xx = แดง (เซิร์ฟเวอร์พัง) · 4xx = ส้ม (client/expected) · อื่นๆ = เทา
+function apiStatusColor(code) {
+    const n = Number(code)
+    if (n >= 500) return 0xff4d4f
+    if (n >= 400) return 0xfa8c16
+    return 0x868e96
+}
+const METHOD_EMOJI = { GET: '📥', POST: '📤', PUT: '✏️', PATCH: '✏️', DELETE: '🗑️' }
 
 function eqEmoji(category) {
     if (!category) return '📦'
@@ -278,6 +330,29 @@ function buildErrorLogEmbed(e) {
         color: lvl.color,
         fields,
         footer: { text: 'BMU Work Management  •  System Status — บันทึกข้อผิดพลาด' },
+    }
+}
+
+function buildApiErrorEmbed(a) {
+    const methodEmoji = METHOD_EMOJI[String(a.method || '').toUpperCase()] || '🔗'
+    const who = a.user_name
+        ? (a.employee_id ? `${a.user_name} (${a.employee_id})` : a.user_name)
+        : (a.employee_id || a.user_id || '-')
+
+    const fields = [
+        { name: '👤 พนักงาน', value: `**${String(who).slice(0, 200)}**`, inline: true },
+        { name: '📡 สถานะ', value: `**${apiStatusLabel(a.status_code)}**`, inline: true },
+    ]
+    if (a.page_path) fields.push({ name: '🖥️ หน้าที่เรียก', value: `\`${String(a.page_path).slice(0, 200)}\``, inline: false })
+    if (a.response_ms != null) fields.push({ name: '⏱️ ใช้เวลา', value: `${a.response_ms} ms`, inline: true })
+    if (a.ip_address) fields.push({ name: '🌐 IP', value: `\`${String(a.ip_address).slice(0, 60)}\``, inline: true })
+
+    return {
+        author: { name: '👥 พนักงานเรียก API แล้ว error' },
+        title: `${methodEmoji}  ${String(a.method || '').toUpperCase()} ${String(a.endpoint || '-').slice(0, 230)}`,
+        color: apiStatusColor(a.status_code),
+        fields,
+        footer: { text: 'BMU Work Management  •  System Status — API access log' },
     }
 }
 
@@ -429,11 +504,61 @@ async function handleCheckinEvent(msg) {
     await postToWebhook(CHECKIN_WEBHOOK, buildCheckinEmbed(ev), `checkin ${ev.username}`, CHECKIN_MENTION)
 }
 
-// --- error log: dedup + rate-limit state (กัน error storm ท่วม Discord) ---
-const errlogDedup = new Map() // signature → last-sent ms
-let errlogMinuteStart = 0 // เริ่มของหน้าต่าง 1 นาทีปัจจุบัน
-let errlogMinuteCount = 0 // จำนวนที่โพสต์ไปในนาทีนี้
-let errlogSuppressed = 0 // จำนวนที่ถูกระงับ (เกิน cap) ในนาทีนี้
+// ============================================================
+// Throttle — dedup + per-minute rate cap (shared: error_log + api_error)
+// กัน notification storm ท่วม Discord + เลี่ยง Discord rate limit (~30/นาที)
+// ============================================================
+function createThrottle({ dedupSec, maxPerMin, onSummary }) {
+    const dedup = new Map() // signature → last-sent ms
+    let minuteStart = 0
+    let minuteCount = 0
+    let suppressed = 0
+
+    // คืน true ถ้า "ควรโพสต์", false ถ้าโดน dedup หรือเกิน cap
+    return function shouldPost(signature, now) {
+        // 1) dedup — signature เดิมซ้ำภายใน window → ข้าม
+        const last = dedup.get(signature)
+        if (last && now - last < dedupSec * 1000) return false
+        dedup.set(signature, now)
+        if (dedup.size > 500) {
+            // กวาด entry เก่ากัน map โตไม่จำกัด
+            for (const [k, t] of dedup) {
+                if (now - t > dedupSec * 1000) dedup.delete(k)
+            }
+        }
+        // 2) per-minute cap — ขึ้นนาทีใหม่ → สรุปยอดที่ระงับของนาทีก่อน (ถ้ามี)
+        if (now - minuteStart >= 60000) {
+            if (suppressed > 0 && onSummary) onSummary(suppressed)
+            minuteStart = now
+            minuteCount = 0
+            suppressed = 0
+        }
+        if (minuteCount >= maxPerMin) {
+            suppressed++
+            return false
+        }
+        minuteCount++
+        return true
+    }
+}
+
+// --- error log ---
+const errlogThrottle = createThrottle({
+    dedupSec: ERROR_LOG_DEDUP_SEC,
+    maxPerMin: ERROR_LOG_MAX_PER_MIN,
+    onSummary: (n) =>
+        postToWebhook(
+            ERROR_LOG_WEBHOOK,
+            {
+                author: { name: '🐞 ข้อผิดพลาดจำนวนมาก' },
+                description: `ระงับการแจ้งเตือน **${n}** รายการในนาทีที่ผ่านมา (เกินลิมิต ${ERROR_LOG_MAX_PER_MIN}/นาที)\nดูทั้งหมดที่ **System Status → บันทึกข้อผิดพลาด**`,
+                color: 0x820014,
+                footer: { text: 'BMU Work Management  •  System Status' },
+            },
+            `error storm summary (${n})`,
+            ERROR_LOG_MENTION
+        ),
+})
 
 function errlogSignature(e) {
     return [e.level, e.category, e.error_code, String(e.message || '').slice(0, 120)].join('|')
@@ -447,54 +572,51 @@ async function handleNewErrorLog(msg) {
         console.error('⚠️ Failed to parse new_error_log payload:', err.message)
         return
     }
-
-    // 1) กรองตาม level allowlist (ว่าง = ทุก level)
+    // กรองตาม level allowlist (ว่าง = ทุก level)
     const level = String(e.level || 'error').toLowerCase()
     if (ERROR_LOG_LEVELS.length > 0 && !ERROR_LOG_LEVELS.includes(level)) return
-
-    const now = Date.now()
-
-    // 2) dedup — error ตัวเดิมซ้ำภายใน window → ข้าม
-    const sig = errlogSignature(e)
-    const last = errlogDedup.get(sig)
-    if (last && now - last < ERROR_LOG_DEDUP_SEC * 1000) return
-    errlogDedup.set(sig, now)
-    if (errlogDedup.size > 500) {
-        // กวาด entry เก่ากัน map โตไม่จำกัด
-        for (const [k, t] of errlogDedup) {
-            if (now - t > ERROR_LOG_DEDUP_SEC * 1000) errlogDedup.delete(k)
-        }
-    }
-
-    // 3) global rate cap ต่อ 1 นาที — กัน flood error คนละชนิด
-    if (now - errlogMinuteStart >= 60000) {
-        // ขึ้นนาทีใหม่ — ถ้านาทีก่อนมีการระงับ ให้สรุป 1 ข้อความ
-        if (errlogSuppressed > 0) {
-            const suppressed = errlogSuppressed
-            await postToWebhook(
-                ERROR_LOG_WEBHOOK,
-                {
-                    author: { name: '🐞 ข้อผิดพลาดจำนวนมาก' },
-                    description: `ระงับการแจ้งเตือน **${suppressed}** รายการในนาทีที่ผ่านมา (เกินลิมิต ${ERROR_LOG_MAX_PER_MIN}/นาที)\nดูทั้งหมดที่ **System Status → บันทึกข้อผิดพลาด**`,
-                    color: 0x820014,
-                    footer: { text: 'BMU Work Management  •  System Status' },
-                },
-                `error storm summary (${suppressed})`,
-                ERROR_LOG_MENTION
-            )
-        }
-        errlogMinuteStart = now
-        errlogMinuteCount = 0
-        errlogSuppressed = 0
-    }
-    if (errlogMinuteCount >= ERROR_LOG_MAX_PER_MIN) {
-        errlogSuppressed++
-        return
-    }
-    errlogMinuteCount++
+    if (!errlogThrottle(errlogSignature(e), Date.now())) return
 
     console.log(`📬 new_error_log [${level}] ${e.category} — ${String(e.message || '').slice(0, 80)}`)
     await postToWebhook(ERROR_LOG_WEBHOOK, buildErrorLogEmbed(e), `error #${e.id} (${e.category})`, ERROR_LOG_MENTION)
+}
+
+// --- API error (per-user 4xx/5xx) ---
+const apiErrorThrottle = createThrottle({
+    dedupSec: API_ERROR_DEDUP_SEC,
+    maxPerMin: API_ERROR_MAX_PER_MIN,
+    onSummary: (n) =>
+        postToWebhook(
+            API_ERROR_WEBHOOK,
+            {
+                author: { name: '👥 API error จำนวนมาก' },
+                description: `ระงับการแจ้งเตือน **${n}** รายการในนาทีที่ผ่านมา (เกินลิมิต ${API_ERROR_MAX_PER_MIN}/นาที)\nดูทั้งหมดที่ **System Status → การเรียก API ที่ error ตามพนักงาน**`,
+                color: 0x820014,
+                footer: { text: 'BMU Work Management  •  System Status' },
+            },
+            `api-error storm summary (${n})`,
+            API_ERROR_MENTION
+        ),
+})
+
+function apiErrorSignature(a) {
+    return [a.user_id, a.method, a.endpoint, a.status_code].join('|')
+}
+
+async function handleNewApiError(msg) {
+    let a
+    try {
+        a = JSON.parse(msg.payload)
+    } catch (err) {
+        console.error('⚠️ Failed to parse new_api_error payload:', err.message)
+        return
+    }
+    // กรองตาม status threshold (default 500 = เฉพาะ 5xx; ตั้ง API_ERROR_MIN_STATUS=400 เพื่อรวม 4xx)
+    if (Number(a.status_code) < API_ERROR_MIN_STATUS) return
+    if (!apiErrorThrottle(apiErrorSignature(a), Date.now())) return
+
+    console.log(`📬 new_api_error ${a.status_code} ${a.method} ${a.endpoint} — ${a.user_name || a.user_id}`)
+    await postToWebhook(API_ERROR_WEBHOOK, buildApiErrorEmbed(a), `api-error #${a.id} (${a.status_code})`, API_ERROR_MENTION)
 }
 
 // ============================================================
@@ -528,6 +650,9 @@ async function connectAndListen() {
             case 'new_error_log':
                 if (ERROR_LOG_WEBHOOK) await handleNewErrorLog(msg)
                 break
+            case 'new_api_error':
+                if (API_ERROR_WEBHOOK) await handleNewApiError(msg)
+                break
         }
     })
 
@@ -552,6 +677,9 @@ async function connectAndListen() {
         if (ERROR_LOG_WEBHOOK) {
             channels.push('new_error_log')
         }
+        if (API_ERROR_WEBHOOK) {
+            channels.push('new_api_error')
+        }
         for (const ch of channels) {
             await client.query(`LISTEN ${ch}`)
         }
@@ -571,6 +699,11 @@ async function connectAndListen() {
         } else {
             const lvls = ERROR_LOG_LEVELS.length ? `levels: ${ERROR_LOG_LEVELS.join(', ')}` : 'all levels'
             console.log(`✅ Error log notify enabled (${lvls}) — dedup ${ERROR_LOG_DEDUP_SEC}s, cap ${ERROR_LOG_MAX_PER_MIN}/min, mention "${ERROR_LOG_MENTION || '(none)'}"`)
+        }
+        if (!API_ERROR_WEBHOOK) {
+            console.log('ℹ️  DISCORD_WEBHOOK_API_ERROR not set — API error notifications disabled')
+        } else {
+            console.log(`✅ API error notify enabled (status >= ${API_ERROR_MIN_STATUS}) — dedup ${API_ERROR_DEDUP_SEC}s, cap ${API_ERROR_MAX_PER_MIN}/min, mention "${API_ERROR_MENTION || '(none)'}"`)
         }
     } catch (error) {
         console.error('💥 Failed to connect/listen:', error.message)
@@ -636,6 +769,7 @@ function startKeepAliveServer() {
                     equipment_borrowings: !!EQUIPMENT_WEBHOOK,
                     checkins: !!CHECKIN_WEBHOOK && CHECKIN_USERNAMES.length > 0,
                     error_logs: !!ERROR_LOG_WEBHOOK,
+                    api_errors: !!API_ERROR_WEBHOOK,
                 },
             }))
         } else {

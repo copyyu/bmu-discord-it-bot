@@ -12,8 +12,11 @@ Standalone Discord bot ที่ฟัง PostgreSQL NOTIFY และส่ง�
 | ขอยืมอุปกรณ์ / อนุมัติ | `new_equipment_borrowing`, `equipment_borrowing_resolved` | `DISCORD_WEBHOOK_EQUIPMENT` | ปิดได้ |
 | เช็คอิน/เอาท์ (allowlist) | `gps_checkin_event` | `DISCORD_WEBHOOK_CHECKIN` | ปิดได้ |
 | **Error log (500 / crash)** | **`new_error_log`** | **`DISCORD_WEBHOOK_ERROR_LOG`** | ปิดได้ |
+| **API error ตามพนักงาน (4xx/5xx)** | **`new_api_error`** | **`DISCORD_WEBHOOK_API_ERROR`** | ปิดได้ |
 
 > **Error log** = แจ้งเตือนเมื่อ backend เกิด error ที่ถูกเขียนลงตาราง `error_logs` (หน้า System Status → "บันทึกข้อผิดพลาด") — มาจาก Express 500 handler / `uncaughtException` / `unhandledRejection`. มี **dedup** (error ตัวเดิมซ้ำใน 60 วิ → ข้าม) + **rate cap** (≤15/นาที, เกินจะสรุปเป็น 1 ข้อความ) กัน error storm ท่วม channel. ไม่ ping โดย default (ตั้ง `ERROR_LOG_MENTION=@everyone` เพื่อเปิด)
+>
+> **API error** = แจ้งเตือนเมื่อ "พนักงานเรียก API แล้ว error 4xx/5xx" (ตาราง `api_access_logs`, หน้า System Status → "การเรียก API ที่ error ตามพนักงาน"). บอก: ใคร / method+endpoint / status / หน้าที่เรียก / IP. **volume สูงกว่า error log** → กรองด้วย `API_ERROR_MIN_STATUS` (**default 500 = เฉพาะ 5xx**; ตั้ง 400 เพื่อรวม 4xx) + dedup 5 นาที + cap 10/นาที. ⚠️ 5xx จะเด้งทั้ง channel นี้ **และ** error log (คนละมุม: "ใครเจอ" vs "error อะไร")
 
 ## How it works
 
@@ -183,6 +186,8 @@ pm2 startup  # ทำตาม instruction เพื่อ auto-start เมื�
 | Bot ไม่ start | ดูว่าใส่ `DATABASE_URL` และ `DISCORD_WEBHOOK_IT_TICKET` ครบหรือยัง |
 | Error log ไม่เด้ง | (1) ตั้ง `DISCORD_WEBHOOK_ERROR_LOG` แล้วยัง? (2) ติดตั้ง trigger แล้ว: `SELECT tgname FROM pg_trigger WHERE tgname = 'error_logs_notify_insert'` (3) ทดสอบ: `npm run test:error` |
 | Error เด้งซ้ำๆ ถี่ | ปกติ — มี dedup 60 วิ + cap 15/นาที. ปรับ `ERROR_LOG_DEDUP_SEC` / `ERROR_LOG_MAX_PER_MIN` ได้ |
+| API error ไม่เด้ง | (1) ตั้ง `DISCORD_WEBHOOK_API_ERROR` แล้วยัง? (2) status ต่ำกว่า `API_ERROR_MIN_STATUS` (default 500) — 4xx ถูกกรองทิ้ง ตั้ง `=400` เพื่อรวม (3) trigger: `SELECT tgname FROM pg_trigger WHERE tgname='api_access_logs_notify_insert'` (4) `npm run test:apierror` |
+| API error spam เยอะ | ขึ้น `API_ERROR_MIN_STATUS=500` (เฉพาะ 5xx) หรือเพิ่ม `API_ERROR_DEDUP_SEC` / ลด `API_ERROR_MAX_PER_MIN` |
 
 ## Uninstall
 
@@ -194,6 +199,8 @@ pm2 startup  # ทำตาม instruction เพื่อ auto-start เมื�
    DROP FUNCTION IF EXISTS notify_new_it_ticket();
    DROP TRIGGER IF EXISTS error_logs_notify_insert ON error_logs;
    DROP FUNCTION IF EXISTS notify_new_error_log();
+   DROP TRIGGER IF EXISTS api_access_logs_notify_insert ON api_access_logs;
+   DROP FUNCTION IF EXISTS notify_new_api_error();
    -- (และ trigger อื่นๆ ที่ไม่ใช้: equipment_borrowings_*, gps_checkins_notify_insert)
    ```
 

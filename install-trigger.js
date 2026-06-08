@@ -46,6 +46,7 @@ try {
         'equipment_borrowings_notify_update',
         'gps_checkins_notify_insert',
         'error_logs_notify_insert',
+        'api_access_logs_notify_insert',
     ]
     const result = await client.query(
         `SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])`,
