@@ -12,6 +12,7 @@
  *   node --env-file=.env test-notify.js checkout  # ทดสอบเช็คเอาท์
  *   node --env-file=.env test-notify.js ticket    # ทดสอบ IT ticket
  *   node --env-file=.env test-notify.js borrow    # ทดสอบยืมอุปกรณ์
+ *   node --env-file=.env test-notify.js error     # ทดสอบ error log
  */
 
 import pg from 'pg'
@@ -79,11 +80,30 @@ const FIXTURES = {
             status: 'pending',
         },
     },
+    error: {
+        channel: 'new_error_log',
+        payload: {
+            id: 999999,
+            level: 'error',
+            category: 'database',
+            source: 'express_handler',
+            error_code: '23505',
+            message: 'duplicate key value violates unique constraint "users_email_key" [TEST] — ลบทิ้งได้',
+            stack:
+                'error: duplicate key value violates unique constraint "users_email_key"\n' +
+                '    at /app/backend/routes/users/index.js:142:20\n' +
+                '    at processTicksAndRejections (node:internal/process/task_queues:95:5)',
+            endpoint: 'POST /api/users',
+            status_code: 500,
+            user_id: 'test-user',
+            created_at: new Date().toISOString(),
+        },
+    },
 }
 
 const fixture = FIXTURES[which]
 if (!fixture) {
-    console.error(`❌ ไม่รู้จัก "${which}" — ใช้ได้: checkin | checkout | ticket | borrow`)
+    console.error(`❌ ไม่รู้จัก "${which}" — ใช้ได้: checkin | checkout | ticket | borrow | error`)
     process.exit(1)
 }
 
@@ -100,8 +120,8 @@ try {
     console.log(`✅ ส่ง test NOTIFY บน channel "${fixture.channel}" แล้ว`)
     console.log('   → เช็ค Discord channel ที่เกี่ยวข้องว่าเด้งมั้ย (ภายใน 1-2 วินาที)')
     console.log('   → ดู bot log: ควรเห็น "📬 ..." ตามด้วย "✅ Sent ..."')
-    if (which === 'ticket' || which === 'borrow') {
-        console.log('   หมายเหตุ: message นี้จะไม่ถูกลบอัตโนมัติ (id 999999 ไม่มีจริงใน DB) — ลบเองได้')
+    if (which === 'ticket' || which === 'borrow' || which === 'error') {
+        console.log('   หมายเหตุ: message นี้จะไม่ถูกลบอัตโนมัติ — ลบเองได้')
     }
 } catch (error) {
     console.error('💥 ส่ง notify ไม่สำเร็จ:', error.message)

@@ -12,7 +12,8 @@
         "test:checkin": "node --env-file=.env test-notify.js checkin",
         "test:checkout": "node --env-file=.env test-notify.js checkout",
         "test:ticket": "node --env-file=.env test-notify.js ticket",
-        "test:borrow": "node --env-file=.env test-notify.js borrow"
+        "test:borrow": "node --env-file=.env test-notify.js borrow",
+        "test:error": "node --env-file=.env test-notify.js error"
     },
     "engines": {
         "node": ">=18"

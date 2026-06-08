@@ -1,8 +1,19 @@
 # BMU Discord IT Bot
 
-Standalone Discord bot ที่ฟัง PostgreSQL NOTIFY และส่งแจ้งเตือนทุก IT ticket ใหม่เข้า Discord channel แบบ real-time
+Standalone Discord bot ที่ฟัง PostgreSQL NOTIFY และส่งแจ้งเตือนแบบ real-time เข้า Discord channel
 
 **ไม่ผูกกับ web app เลย** — bot นี้รันแยก ดูแลแยก ลบ/แก้ได้โดยไม่กระทบระบบหลัก สื่อกลางคือ PostgreSQL trigger ที่ติดตั้งครั้งเดียวด้วย `setup.sql`
+
+## Notification channels
+
+| Event | NOTIFY channel | Webhook env | บังคับ? |
+|-------|----------------|-------------|---------|
+| IT ticket ใหม่ / resolve | `new_it_ticket`, `it_ticket_resolved` | `DISCORD_WEBHOOK_IT_TICKET` | ✅ จำเป็น |
+| ขอยืมอุปกรณ์ / อนุมัติ | `new_equipment_borrowing`, `equipment_borrowing_resolved` | `DISCORD_WEBHOOK_EQUIPMENT` | ปิดได้ |
+| เช็คอิน/เอาท์ (allowlist) | `gps_checkin_event` | `DISCORD_WEBHOOK_CHECKIN` | ปิดได้ |
+| **Error log (500 / crash)** | **`new_error_log`** | **`DISCORD_WEBHOOK_ERROR_LOG`** | ปิดได้ |
+
+> **Error log** = แจ้งเตือนเมื่อ backend เกิด error ที่ถูกเขียนลงตาราง `error_logs` (หน้า System Status → "บันทึกข้อผิดพลาด") — มาจาก Express 500 handler / `uncaughtException` / `unhandledRejection`. มี **dedup** (error ตัวเดิมซ้ำใน 60 วิ → ข้าม) + **rate cap** (≤15/นาที, เกินจะสรุปเป็น 1 ข้อความ) กัน error storm ท่วม channel. ไม่ ping โดย default (ตั้ง `ERROR_LOG_MENTION=@everyone` เพื่อเปิด)
 
 ## How it works
 
@@ -170,6 +181,8 @@ pm2 startup  # ทำตาม instruction เพื่อ auto-start เมื�
 | `Discord 401` | webhook URL ผิดหรือถูกลบ → สร้างใหม่ |
 | `Discord 429` | Rate limited — ถ้ายิงเยอะมาก (>30/นาที) ต้องเพิ่ม queue |
 | Bot ไม่ start | ดูว่าใส่ `DATABASE_URL` และ `DISCORD_WEBHOOK_IT_TICKET` ครบหรือยัง |
+| Error log ไม่เด้ง | (1) ตั้ง `DISCORD_WEBHOOK_ERROR_LOG` แล้วยัง? (2) ติดตั้ง trigger แล้ว: `SELECT tgname FROM pg_trigger WHERE tgname = 'error_logs_notify_insert'` (3) ทดสอบ: `npm run test:error` |
+| Error เด้งซ้ำๆ ถี่ | ปกติ — มี dedup 60 วิ + cap 15/นาที. ปรับ `ERROR_LOG_DEDUP_SEC` / `ERROR_LOG_MAX_PER_MIN` ได้ |
 
 ## Uninstall
 
@@ -179,6 +192,9 @@ pm2 startup  # ทำตาม instruction เพื่อ auto-start เมื�
    ```sql
    DROP TRIGGER IF EXISTS it_tickets_notify_insert ON it_tickets;
    DROP FUNCTION IF EXISTS notify_new_it_ticket();
+   DROP TRIGGER IF EXISTS error_logs_notify_insert ON error_logs;
+   DROP FUNCTION IF EXISTS notify_new_error_log();
+   -- (และ trigger อื่นๆ ที่ไม่ใช้: equipment_borrowings_*, gps_checkins_notify_insert)
    ```
 
 ## Architecture notes

@@ -11,6 +11,10 @@
 --     4) คอลัมน์ equipment_borrowings.discord_message_id
 --     5) INSERT trigger → NOTIFY 'new_equipment_borrowing' (JOIN equipment + users)
 --     6) UPDATE trigger → NOTIFY 'equipment_borrowing_resolved' (approved/rejected)
+--   GPS Check-in:
+--     7) INSERT trigger → NOTIFY 'gps_checkin_event' (bot กรองตาม username)
+--   Error Logs (System Status):
+--     8) INSERT trigger → NOTIFY 'new_error_log' (แจ้งทุก error ใหม่ที่ backend log)
 --
 -- รันซ้ำได้ปลอดภัย (idempotent)
 --
@@ -209,8 +213,72 @@ CREATE TRIGGER gps_checkins_notify_insert
     FOR EACH ROW
     EXECUTE FUNCTION notify_gps_checkin();
 
+
+-- ============================================================
+-- ERROR LOGS  (System Status → "บันทึกข้อผิดพลาด")
+-- ============================================================
+-- แจ้งเตือนทุก error ใหม่ที่ backend เขียนลงตาราง error_logs
+--   (500 จาก Express handler / uncaughtException = fatal / unhandledRejection
+--    — ดู backend/utils/errorLogger.js). volume ต่ำมากโดยปกติ (รูปในหน้าเพจ = 0/24ชม.)
+-- ไม่เก็บ discord_message_id — error log เป็น log ถาวร ไม่มีการลบข้อความ (เหมือน check-in)
+--
+-- ⚠️ pg_notify จำกัด payload 8000 bytes — ตัด message/stack ให้สั้นใน trigger
+--    และห่อด้วย EXCEPTION block: ถ้า notify ล้มเหลว (payload เกิน/อื่นๆ) ห้ามให้
+--    INSERT error_logs rollback (error_logs คือ safety net ของระบบ logging ห้ามพัง)
+-- error_logs ถูกสร้างโดย backend ตอน boot (ensureErrorLogsTable) — ใส่ CREATE IF NOT EXISTS
+--    เผื่อรัน setup ก่อน backend boot (idempotent, schema ตรงกับ backend)
+
+CREATE TABLE IF NOT EXISTS error_logs (
+    id          SERIAL PRIMARY KEY,
+    level       VARCHAR(10)  NOT NULL DEFAULT 'error',
+    category    VARCHAR(40)  NOT NULL DEFAULT 'unknown',
+    source      VARCHAR(40)  NOT NULL DEFAULT 'manual',
+    error_code  VARCHAR(60),
+    message     TEXT         NOT NULL,
+    stack       TEXT,
+    endpoint    VARCHAR(255),
+    status_code INTEGER,
+    user_id     VARCHAR(36),
+    ip_address  VARCHAR(64),
+    metadata    TEXT,
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION notify_new_error_log()
+RETURNS trigger AS $$
+BEGIN
+    -- ห่อ pg_notify ด้วย sub-block: notify พังต้องไม่ทำให้ INSERT error_logs พัง
+    BEGIN
+        PERFORM pg_notify('new_error_log', json_build_object(
+            'id',          NEW.id,
+            'level',       NEW.level,
+            'category',    NEW.category,
+            'source',      NEW.source,
+            'error_code',  NEW.error_code,
+            'message',     LEFT(NEW.message, 1500),
+            'stack',       LEFT(NEW.stack, 600),
+            'endpoint',    NEW.endpoint,
+            'status_code', NEW.status_code,
+            'user_id',     NEW.user_id,
+            'created_at',  NEW.created_at
+        )::text);
+    EXCEPTION WHEN OTHERS THEN
+        NULL; -- notify ล้มเหลว (เช่น payload > 8000 bytes) — ปล่อยผ่าน ไม่ให้ logging พัง
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS error_logs_notify_insert ON error_logs;
+CREATE TRIGGER error_logs_notify_insert
+    AFTER INSERT ON error_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_new_error_log();
+
 -- เสร็จ — ทดสอบโดย:
 --   IT ticket: สร้าง ticket → เด้ง channel #1 / กด resolve → message หาย
 --   Equipment: กดยืม → เด้ง channel #2 / admin approve/reject → message หาย
 --   Check-in:  คนใน CHECKIN_USERNAMES เช็คอิน/เอาท์ → เด้ง channel #3
 --               (คนอื่นไม่เด้ง — bot กรอง, test check-in ไม่เด้ง — trigger กรอง)
+--   Error log: backend เกิด error (500/crash) → เด้ง channel #4
+--               (npm run test:error เพื่อยิง fake error เข้า bot)

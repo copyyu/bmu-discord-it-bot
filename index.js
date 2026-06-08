@@ -11,6 +11,10 @@
  *   Check-in/out (optional — only if DISCORD_WEBHOOK_CHECKIN set):
  *     - gps_checkin_event           → POST embed via DISCORD_WEBHOOK_CHECKIN
  *                                     filtered by CHECKIN_USERNAMES allowlist
+ *   Error logs (optional — only if DISCORD_WEBHOOK_ERROR_LOG set):
+ *     - new_error_log               → POST embed via DISCORD_WEBHOOK_ERROR_LOG
+ *                                     (backend 500 / crash → System Status page)
+ *                                     deduped + rate-capped to survive error storms
  *
  * No coupling with the web app — the only contract is the DB triggers in setup.sql
  *
@@ -23,6 +27,11 @@
  *   DISCORD_WEBHOOK_CHECKIN   enable check-in/out notifications
  *   CHECKIN_USERNAMES         comma-separated usernames to notify on check-in (else none)
  *   CHECKIN_MENTION           mention for check-in (default '' = no ping, avoid spam)
+ *   DISCORD_WEBHOOK_ERROR_LOG enable backend error-log notifications
+ *   ERROR_LOG_MENTION         mention for errors (default '' = no ping)
+ *   ERROR_LOG_LEVELS          comma-separated level allowlist e.g. "error,fatal" (default all)
+ *   ERROR_LOG_DEDUP_SEC       suppress identical error within N seconds (default 60)
+ *   ERROR_LOG_MAX_PER_MIN     global cap of error posts per minute (default 15)
  *   PORT                      if set, starts HTTP server with /health endpoint
  *   RENDER_EXTERNAL_URL       auto-set on Render → enables self-ping
  *   SELF_PING_URL             manual override if not on Render
@@ -61,6 +70,20 @@ const CHECKIN_USERNAMES = (process.env.CHECKIN_USERNAMES || '')
     .filter(Boolean)
 // check-in ไม่ ping ใครโดย default (เป็น log เฉยๆ — ป้องกัน spam @everyone วันละหลายสิบครั้ง)
 const CHECKIN_MENTION = process.env.CHECKIN_MENTION ?? ''
+
+// ===== Error log (System Status → บันทึกข้อผิดพลาด) =====
+const ERROR_LOG_WEBHOOK = process.env.DISCORD_WEBHOOK_ERROR_LOG?.split('?')[0] || null
+// error ไม่ ping โดย default (errorอาจมาเป็นชุด — กัน @everyone spam). ตั้ง @everyone/<@&ROLE> เพื่อเปิด
+const ERROR_LOG_MENTION = process.env.ERROR_LOG_MENTION ?? ''
+// allowlist level ที่จะแจ้ง (คั่นด้วย comma) — ว่าง = ทุก level ที่ลงใน error_logs
+const ERROR_LOG_LEVELS = (process.env.ERROR_LOG_LEVELS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+// dedup: error ตัวเดิม (level+category+code+message) ซ้ำภายใน N วิ → ข้าม (default 60)
+const ERROR_LOG_DEDUP_SEC = Number(process.env.ERROR_LOG_DEDUP_SEC) || 60
+// global cap: โพสต์ error ได้ไม่เกิน N ครั้ง/นาที (default 15) — กัน flood (Discord limit ~30/นาที)
+const ERROR_LOG_MAX_PER_MIN = Number(process.env.ERROR_LOG_MAX_PER_MIN) || 15
 
 // ============================================================
 // IT TICKET metadata
@@ -116,6 +139,42 @@ const BORROW_STATUS_BADGE = {
 const CHECKIN_TYPE_META = {
     check_in: { emoji: '🟢', label: 'เช็คอินเข้างาน', color: 0x20c997 },
     check_out: { emoji: '🔴', label: 'เช็คเอาท์ออกงาน', color: 0xfa5252 },
+}
+
+// ============================================================
+// ERROR LOG metadata
+// ============================================================
+const ERRLOG_LEVEL_META = {
+    fatal: { emoji: '💀', label: 'FATAL', color: 0x820014 }, // dark red
+    error: { emoji: '🔴', label: 'ERROR', color: 0xff4d4f }, // red
+    warn: { emoji: '🟠', label: 'WARNING', color: 0xfa8c16 }, // orange
+    info: { emoji: '🔵', label: 'INFO', color: 0x1890ff }, // blue
+}
+const ERRLOG_LEVEL_DEFAULT = { emoji: '⚠️', label: 'ERROR', color: 0xff4d4f }
+
+// "พื้นที่ต้นเหตุ" — ตรงกับ classifyError() ใน backend/utils/errorLogger.js
+const ERRLOG_CATEGORY_META = {
+    database: { emoji: '🗄️', label: 'ฐานข้อมูล' },
+    external: { emoji: '🌐', label: 'ระบบภายนอก / เครือข่าย' },
+    auth: { emoji: '🔐', label: 'สิทธิ์ / ยืนยันตัวตน' },
+    validation: { emoji: '📋', label: 'ตรวจสอบข้อมูล' },
+    server: { emoji: '🖥️', label: 'เซิร์ฟเวอร์' },
+    unknown: { emoji: '❓', label: 'ไม่ทราบ' },
+}
+
+// source → label อ่านง่าย (ตรงกับ logError ctx.source ใน backend)
+const ERRLOG_SOURCE_LABEL = {
+    express_handler: 'Express handler (500)',
+    uncaught_exception: 'Uncaught Exception',
+    unhandled_rejection: 'Unhandled Rejection',
+    manual: 'Manual',
+}
+
+function errlogCategoryLabel(category) {
+    if (!category) return '❓ ไม่ทราบ'
+    if (category.startsWith('route:')) return `🧩 Route: ${category.slice(6)}`
+    const m = ERRLOG_CATEGORY_META[category]
+    return m ? `${m.emoji} ${m.label}` : `📌 ${category}`
 }
 
 function eqEmoji(category) {
@@ -190,6 +249,35 @@ function buildCheckinEmbed(ev) {
             { name: '📍 ระยะห่างจากออฟฟิศ', value: dist, inline: true },
         ],
         footer: { text: 'BMU Work Management  •  Attendance' },
+    }
+}
+
+function buildErrorLogEmbed(e) {
+    const lvl = ERRLOG_LEVEL_META[String(e.level || '').toLowerCase()] || ERRLOG_LEVEL_DEFAULT
+    const rawMsg = String(e.message || '(ไม่มีข้อความ)').slice(0, 1500)
+    const quotedMsg = rawMsg.split('\n').map((line) => `> ${line}`).join('\n')
+
+    const fields = [
+        { name: '🚦 ระดับ', value: `**${lvl.label}**`, inline: true },
+        { name: '📍 พื้นที่ต้นเหตุ', value: errlogCategoryLabel(e.category), inline: true },
+    ]
+    if (e.error_code) fields.push({ name: '🔢 Error code', value: `\`${String(e.error_code).slice(0, 100)}\``, inline: true })
+    if (e.endpoint) fields.push({ name: '🔗 Endpoint', value: `\`${String(e.endpoint).slice(0, 200)}\``, inline: false })
+    if (e.status_code) fields.push({ name: '📡 HTTP', value: `\`${e.status_code}\``, inline: true })
+    if (e.source) fields.push({ name: '🧱 ต้นทาง', value: ERRLOG_SOURCE_LABEL[e.source] || `\`${e.source}\``, inline: true })
+    if (e.stack) {
+        // field value limit 1024 — stack ถูกตัดเหลือ 600 จาก trigger แล้ว เผื่อ code-fence
+        const stack = String(e.stack).slice(0, 900).replace(/```/g, "'''")
+        fields.push({ name: '🧵 Stack (ย่อ)', value: '```\n' + stack + '\n```', inline: false })
+    }
+
+    return {
+        author: { name: '🐞 พบข้อผิดพลาดใหม่ในระบบ' },
+        title: `${lvl.emoji}  ${String(e.error_code || lvl.label).slice(0, 240)}`,
+        description: `${quotedMsg}\n​`,
+        color: lvl.color,
+        fields,
+        footer: { text: 'BMU Work Management  •  System Status — บันทึกข้อผิดพลาด' },
     }
 }
 
@@ -341,6 +429,74 @@ async function handleCheckinEvent(msg) {
     await postToWebhook(CHECKIN_WEBHOOK, buildCheckinEmbed(ev), `checkin ${ev.username}`, CHECKIN_MENTION)
 }
 
+// --- error log: dedup + rate-limit state (กัน error storm ท่วม Discord) ---
+const errlogDedup = new Map() // signature → last-sent ms
+let errlogMinuteStart = 0 // เริ่มของหน้าต่าง 1 นาทีปัจจุบัน
+let errlogMinuteCount = 0 // จำนวนที่โพสต์ไปในนาทีนี้
+let errlogSuppressed = 0 // จำนวนที่ถูกระงับ (เกิน cap) ในนาทีนี้
+
+function errlogSignature(e) {
+    return [e.level, e.category, e.error_code, String(e.message || '').slice(0, 120)].join('|')
+}
+
+async function handleNewErrorLog(msg) {
+    let e
+    try {
+        e = JSON.parse(msg.payload)
+    } catch (err) {
+        console.error('⚠️ Failed to parse new_error_log payload:', err.message)
+        return
+    }
+
+    // 1) กรองตาม level allowlist (ว่าง = ทุก level)
+    const level = String(e.level || 'error').toLowerCase()
+    if (ERROR_LOG_LEVELS.length > 0 && !ERROR_LOG_LEVELS.includes(level)) return
+
+    const now = Date.now()
+
+    // 2) dedup — error ตัวเดิมซ้ำภายใน window → ข้าม
+    const sig = errlogSignature(e)
+    const last = errlogDedup.get(sig)
+    if (last && now - last < ERROR_LOG_DEDUP_SEC * 1000) return
+    errlogDedup.set(sig, now)
+    if (errlogDedup.size > 500) {
+        // กวาด entry เก่ากัน map โตไม่จำกัด
+        for (const [k, t] of errlogDedup) {
+            if (now - t > ERROR_LOG_DEDUP_SEC * 1000) errlogDedup.delete(k)
+        }
+    }
+
+    // 3) global rate cap ต่อ 1 นาที — กัน flood error คนละชนิด
+    if (now - errlogMinuteStart >= 60000) {
+        // ขึ้นนาทีใหม่ — ถ้านาทีก่อนมีการระงับ ให้สรุป 1 ข้อความ
+        if (errlogSuppressed > 0) {
+            const suppressed = errlogSuppressed
+            await postToWebhook(
+                ERROR_LOG_WEBHOOK,
+                {
+                    author: { name: '🐞 ข้อผิดพลาดจำนวนมาก' },
+                    description: `ระงับการแจ้งเตือน **${suppressed}** รายการในนาทีที่ผ่านมา (เกินลิมิต ${ERROR_LOG_MAX_PER_MIN}/นาที)\nดูทั้งหมดที่ **System Status → บันทึกข้อผิดพลาด**`,
+                    color: 0x820014,
+                    footer: { text: 'BMU Work Management  •  System Status' },
+                },
+                `error storm summary (${suppressed})`,
+                ERROR_LOG_MENTION
+            )
+        }
+        errlogMinuteStart = now
+        errlogMinuteCount = 0
+        errlogSuppressed = 0
+    }
+    if (errlogMinuteCount >= ERROR_LOG_MAX_PER_MIN) {
+        errlogSuppressed++
+        return
+    }
+    errlogMinuteCount++
+
+    console.log(`📬 new_error_log [${level}] ${e.category} — ${String(e.message || '').slice(0, 80)}`)
+    await postToWebhook(ERROR_LOG_WEBHOOK, buildErrorLogEmbed(e), `error #${e.id} (${e.category})`, ERROR_LOG_MENTION)
+}
+
 // ============================================================
 // DB connection — LISTEN on all enabled channels
 // ============================================================
@@ -369,6 +525,9 @@ async function connectAndListen() {
             case 'gps_checkin_event':
                 if (CHECKIN_WEBHOOK) await handleCheckinEvent(msg)
                 break
+            case 'new_error_log':
+                if (ERROR_LOG_WEBHOOK) await handleNewErrorLog(msg)
+                break
         }
     })
 
@@ -390,6 +549,9 @@ async function connectAndListen() {
         if (CHECKIN_WEBHOOK) {
             channels.push('gps_checkin_event')
         }
+        if (ERROR_LOG_WEBHOOK) {
+            channels.push('new_error_log')
+        }
         for (const ch of channels) {
             await client.query(`LISTEN ${ch}`)
         }
@@ -403,6 +565,12 @@ async function connectAndListen() {
             console.log('⚠️  DISCORD_WEBHOOK_CHECKIN set but CHECKIN_USERNAMES empty — no one will be notified')
         } else {
             console.log(`✅ Check-in notify for ${CHECKIN_USERNAMES.length} users: ${CHECKIN_USERNAMES.join(', ')}`)
+        }
+        if (!ERROR_LOG_WEBHOOK) {
+            console.log('ℹ️  DISCORD_WEBHOOK_ERROR_LOG not set — error log notifications disabled')
+        } else {
+            const lvls = ERROR_LOG_LEVELS.length ? `levels: ${ERROR_LOG_LEVELS.join(', ')}` : 'all levels'
+            console.log(`✅ Error log notify enabled (${lvls}) — dedup ${ERROR_LOG_DEDUP_SEC}s, cap ${ERROR_LOG_MAX_PER_MIN}/min, mention "${ERROR_LOG_MENTION || '(none)'}"`)
         }
     } catch (error) {
         console.error('💥 Failed to connect/listen:', error.message)
@@ -467,6 +635,7 @@ function startKeepAliveServer() {
                     it_tickets: true,
                     equipment_borrowings: !!EQUIPMENT_WEBHOOK,
                     checkins: !!CHECKIN_WEBHOOK && CHECKIN_USERNAMES.length > 0,
+                    error_logs: !!ERROR_LOG_WEBHOOK,
                 },
             }))
         } else {
