@@ -248,9 +248,26 @@ CREATE TABLE IF NOT EXISTS error_logs (
 
 CREATE OR REPLACE FUNCTION notify_new_error_log()
 RETURNS trigger AS $$
+DECLARE
+    v_name     TEXT;
+    v_nick     TEXT;
+    v_username TEXT;
 BEGIN
     -- ห่อ pg_notify ด้วย sub-block: notify พังต้องไม่ทำให้ INSERT error_logs พัง
     BEGIN
+        -- ดึงชื่อผู้ใช้ที่เจอ error (user_id มาจาก JWT ตอนยิง request — null ถ้าเป็น error ระดับระบบ)
+        -- ใช้ id::text เทียบ เพราะ error_logs.user_id เป็น VARCHAR — กัน type mismatch
+        -- ห่อ EXCEPTION ซ้อน: lookup พังก็ยังส่ง notify ต่อ (แค่ไม่มีชื่อ)
+        IF NEW.user_id IS NOT NULL THEN
+            BEGIN
+                SELECT u.name, u.nick_name, u.username
+                    INTO v_name, v_nick, v_username
+                    FROM users u WHERE u.id::text = NEW.user_id;
+            EXCEPTION WHEN OTHERS THEN
+                NULL;
+            END;
+        END IF;
+
         PERFORM pg_notify('new_error_log', json_build_object(
             'id',          NEW.id,
             'level',       NEW.level,
@@ -262,6 +279,9 @@ BEGIN
             'endpoint',    NEW.endpoint,
             'status_code', NEW.status_code,
             'user_id',     NEW.user_id,
+            'user_name',   v_name,
+            'user_nick',   v_nick,
+            'username',    v_username,
             'created_at',  NEW.created_at
         )::text);
     EXCEPTION WHEN OTHERS THEN

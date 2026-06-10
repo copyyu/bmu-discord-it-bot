@@ -14,7 +14,7 @@ Standalone Discord bot ที่ฟัง PostgreSQL NOTIFY และส่ง�
 | **Error log (500 / crash)** | **`new_error_log`** | **`DISCORD_WEBHOOK_ERROR_LOG`** | ปิดได้ |
 | **API error ตามพนักงาน (4xx/5xx)** | **`new_api_error`** | **`DISCORD_WEBHOOK_API_ERROR`** | ปิดได้ |
 
-> **Error log** = แจ้งเตือนเมื่อ backend เกิด error ที่ถูกเขียนลงตาราง `error_logs` (หน้า System Status → "บันทึกข้อผิดพลาด") — มาจาก Express 500 handler / `uncaughtException` / `unhandledRejection`. มี **dedup** (error ตัวเดิมซ้ำใน 60 วิ → ข้าม) + **rate cap** (≤15/นาที, เกินจะสรุปเป็น 1 ข้อความ) กัน error storm ท่วม channel. ไม่ ping โดย default (ตั้ง `ERROR_LOG_MENTION=@everyone` เพื่อเปิด)
+> **Error log** = แจ้งเตือนเมื่อ backend เกิด error ที่ถูกเขียนลงตาราง `error_logs` (หน้า System Status → "บันทึกข้อผิดพลาด") — มาจาก Express 500 handler / `uncaughtException` / `unhandledRejection`. embed บอกด้วยว่า **ใครเป็นคนยิง request ที่พัง** (trigger JOIN ตาราง `users` จาก `user_id` → ชื่อ+ชื่อเล่น; error ระดับระบบเช่น crash จะขึ้น "ระบบ"). มี **dedup** (error ตัวเดิมซ้ำใน 60 วิ → ข้าม) + **rate cap** (≤15/นาที, เกินจะสรุปเป็น 1 ข้อความ) กัน error storm ท่วม channel. ไม่ ping โดย default (ตั้ง `ERROR_LOG_MENTION=@everyone` เพื่อเปิด)
 >
 > **API error** = แจ้งเตือนเมื่อ "พนักงานเรียก API แล้ว error 4xx/5xx" (ตาราง `api_access_logs`, หน้า System Status → "การเรียก API ที่ error ตามพนักงาน"). บอก: ใคร / method+endpoint / status / หน้าที่เรียก / IP. **volume สูงกว่า error log** → กรองด้วย `API_ERROR_MIN_STATUS` (**default 500 = เฉพาะ 5xx**; ตั้ง 400 เพื่อรวม 4xx) + dedup 5 นาที + cap 10/นาที. ⚠️ 5xx จะเด้งทั้ง channel นี้ **และ** error log (คนละมุม: "ใครเจอ" vs "error อะไร")
 

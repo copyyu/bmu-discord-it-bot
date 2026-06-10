@@ -309,9 +309,16 @@ function buildErrorLogEmbed(e) {
     const rawMsg = String(e.message || '(ไม่มีข้อความ)').slice(0, 1500)
     const quotedMsg = rawMsg.split('\n').map((line) => `> ${line}`).join('\n')
 
+    // ใครเป็นคนยิง request ที่ทำให้เกิด error — null = error ระดับระบบ (crash/background ไม่มี user)
+    // users.name ใน DB ส่วนใหญ่มีชื่อเล่นวงเล็บอยู่แล้ว เช่น "ชยพล(ต้นปาล์ม)" — ต่อ nick เฉพาะตอนยังไม่มี กันซ้ำ
+    const who = e.user_name
+        ? (e.user_nick && !e.user_name.includes(e.user_nick) ? `${e.user_name} (${e.user_nick})` : e.user_name)
+        : (e.username || e.user_id || null)
+
     const fields = [
         { name: '🚦 ระดับ', value: `**${lvl.label}**`, inline: true },
         { name: '📍 พื้นที่ต้นเหตุ', value: errlogCategoryLabel(e.category), inline: true },
+        { name: '👤 ผู้ใช้ที่เจอ', value: who ? `**${String(who).slice(0, 100)}**` : '_ระบบ (ไม่มี user)_', inline: true },
     ]
     if (e.error_code) fields.push({ name: '🔢 Error code', value: `\`${String(e.error_code).slice(0, 100)}\``, inline: true })
     if (e.endpoint) fields.push({ name: '🔗 Endpoint', value: `\`${String(e.endpoint).slice(0, 200)}\``, inline: false })
