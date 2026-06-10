@@ -253,6 +253,12 @@ DECLARE
     v_nick     TEXT;
     v_username TEXT;
 BEGIN
+    -- แจ้ง Discord เฉพาะระดับ error/fatal — level อื่น (warn/info) เก็บ log อย่างเดียว ไม่ notify
+    -- (ตรงกับ migration 138 ฝั่ง Web_app_BMU_V2 — แก้ที่นั่นต้องแก้ที่นี่ให้ตรงกัน)
+    IF NEW.level NOT IN ('error', 'fatal') THEN
+        RETURN NEW;
+    END IF;
+
     -- ห่อ pg_notify ด้วย sub-block: notify พังต้องไม่ทำให้ INSERT error_logs พัง
     BEGIN
         -- ดึงชื่อผู้ใช้ที่เจอ error (user_id มาจาก JWT ตอนยิง request — null ถ้าเป็น error ระดับระบบ)
