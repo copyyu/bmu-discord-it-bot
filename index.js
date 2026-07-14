@@ -629,7 +629,25 @@ async function handleNewApiError(msg) {
 // ============================================================
 // DB connection — LISTEN on all enabled channels
 // ============================================================
+// Reconnect ต้องเป็น single-flight เท่านั้น: เดิมตั้ง reconnect ได้ 2 ทางพร้อมกัน
+// (handler 'end' + catch ของ connect ล้มเหลว — pg ยิงทั้งสองทางเมื่อ socket ถูกปิด
+// ระหว่างกำลัง connect) ทำให้เกิด client ซ้อน 2 ตัว LISTEN ซ้ำ → Discord เด้งซ้ำ 2 รอบ
+// (incident 2026-07-14 — ดู POSTMORTEM-2026-07-14-duplicate-notifications.md)
+let activeClient = null // client ที่ถือ LISTEN อยู่ปัจจุบัน (null = ยังไม่พร้อม)
+let reconnectTimer = null // มี timer ค้างอยู่ = ห้ามตั้งเพิ่ม
+let generation = 0 // รุ่นของ connection — ใช้เมิน event ที่มาจาก client รุ่นเก่า
+
+function scheduleReconnect(reason) {
+    if (reconnectTimer) return
+    console.warn(`🔌 ${reason} — reconnecting in ${RECONNECT_DELAY_MS}ms`)
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null
+        connectAndListen()
+    }, RECONNECT_DELAY_MS)
+}
+
 async function connectAndListen() {
+    const myGen = ++generation
     const client = new Client({
         connectionString: DATABASE_URL,
         ssl: DATABASE_URL.includes('railway') || DATABASE_URL.includes('render') || DATABASE_URL.includes('amazonaws')
@@ -638,6 +656,11 @@ async function connectAndListen() {
     })
 
     client.on('notification', async (msg) => {
+        // กันซ้ำชั้นสุดท้าย: ถ้ามี client ซ้อนกันด้วยเหตุไม่คาดคิด ให้เฉพาะตัว active ทำงาน
+        if (client !== activeClient) {
+            console.warn(`⚠️ notification "${msg.channel}" on stale client (gen ${myGen}) — ignored`)
+            return
+        }
         switch (msg.channel) {
             case 'new_it_ticket':
                 await handleNewTicket(client, msg)
@@ -664,12 +687,13 @@ async function connectAndListen() {
     })
 
     client.on('error', (err) => {
-        console.error('💥 DB client error:', err.message)
+        console.error(`💥 DB client error (gen ${myGen}):`, err.message)
     })
 
     client.on('end', () => {
-        console.warn(`🔌 DB connection ended — reconnecting in ${RECONNECT_DELAY_MS}ms`)
-        setTimeout(connectAndListen, RECONNECT_DELAY_MS)
+        if (myGen !== generation) return // client รุ่นเก่าตาย — มีรุ่นใหม่ดูแลอยู่แล้ว
+        if (activeClient === client) activeClient = null
+        scheduleReconnect(`DB connection ended (gen ${myGen})`)
     })
 
     try {
@@ -690,7 +714,8 @@ async function connectAndListen() {
         for (const ch of channels) {
             await client.query(`LISTEN ${ch}`)
         }
-        console.log(`👂 Listening on ${channels.length} channels: ${channels.join(', ')}`)
+        activeClient = client
+        console.log(`👂 (gen ${myGen}) Listening on ${channels.length} channels: ${channels.join(', ')}`)
         if (!EQUIPMENT_WEBHOOK) {
             console.log('ℹ️  DISCORD_WEBHOOK_EQUIPMENT not set — equipment borrowing notifications disabled')
         }
@@ -713,8 +738,12 @@ async function connectAndListen() {
             console.log(`✅ API error notify enabled (status >= ${API_ERROR_MIN_STATUS}) — dedup ${API_ERROR_DEDUP_SEC}s, cap ${API_ERROR_MAX_PER_MIN}/min, mention "${API_ERROR_MENTION || '(none)'}"`)
         }
     } catch (error) {
-        console.error('💥 Failed to connect/listen:', error.message)
-        setTimeout(connectAndListen, RECONNECT_DELAY_MS)
+        console.error(`💥 Failed to connect/listen (gen ${myGen}):`, error.message)
+        // เก็บซาก client ที่ค้าง (กัน socket รั่ว) — end() บน client ที่ตายแล้วเป็น no-op
+        try {
+            client.end().catch(() => {})
+        } catch {}
+        scheduleReconnect(`connect failed (gen ${myGen})`)
     }
 }
 

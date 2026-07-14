@@ -179,6 +179,7 @@ pm2 startup  # ทำตาม instruction เพื่อ auto-start เมื�
 
 | อาการ | สาเหตุ / วิธีแก้ |
 |-------|-----------------|
+| **ข้อความเด้งซ้ำ 2 รอบทุก event** | มี listener ซ้อนกัน >1 — เช็ค: `SELECT pid, backend_start FROM pg_stat_activity WHERE query ILIKE 'LISTEN%'` ต้องมี 1 เส้นเท่านั้น. สาเหตุ: (1) bot รันพร้อมกันหลายที่ (Render + local/PM2) → ปิดให้เหลือที่เดียว (2) โค้ดก่อน 14 ก.ค. 2026 มีบั๊ก reconnect ซ้อน → แก้แล้ว, restart service ก็หาย (ดู `POSTMORTEM-2026-07-14-duplicate-notifications.md`) |
 | Bot ไม่ได้รับ event | เช็คว่า trigger ติดตั้งแล้ว: `SELECT tgname FROM pg_trigger WHERE tgname = 'it_tickets_notify_insert'` |
 | `Connection terminated unexpectedly` | DB หลุด — bot จะ reconnect อัตโนมัติทุก 5 วินาที (ดู `RECONNECT_DELAY_MS`) |
 | `Discord 401` | webhook URL ผิดหรือถูกลบ → สร้างใหม่ |
